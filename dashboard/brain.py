@@ -11,12 +11,13 @@ from __future__ import annotations
 import random
 from typing import Optional
 
+from poker.agents import BotAgent, make_tag
 from poker.archetype_ranges import call_open_range, open_range, threebet_range
 from poker.board_texture import analyze_texture
 from poker.equity import equity_vs_random, equity_vs_range
 from poker.evaluator import evaluate
 from poker.game import (
-    Action, ActionType, HandState, Player, Street, legal_actions,
+    Action, ActionType, HandState, HandView, Player, Street, legal_actions,
 )
 from poker.opponent_model import OpponentTable, estimate_fold_equity
 from poker.range_model import Range
@@ -192,6 +193,10 @@ def _render_decision(
     if primary_opp and opponent_table and to_call == 0:
         fold_eq = estimate_fold_equity(primary_opp.id, opponent_table, "cbet") * 100
 
+    # Coach suggestion: spin up a TAG bot with the same context, ask what it
+    # would do given the human's view. Same engine the actual bots use.
+    coach_action = _coach_suggest(state, hero, opponent_table, range_tracker)
+
     return _build_brain_html(
         hero=hero, hand_label=hand_label, made_hand=made_hand_label,
         eq_random=eq_random, eq_range=eq_range,
@@ -200,13 +205,31 @@ def _render_decision(
         primary_opp=primary_opp, primary_opp_stats=primary_opp_stats,
         range_info=range_info, fold_eq=fold_eq,
         state=state, pos=pos,
+        coach_action=coach_action,
     )
+
+
+def _coach_suggest(
+    state: HandState,
+    hero: Player,
+    opponent_table: Optional[OpponentTable],
+    range_tracker: Optional[RangeTracker],
+) -> Optional[Action]:
+    """Ask a TAG-style coach bot what it would do in this exact spot."""
+    coach = make_tag("Coach", rng=random.Random(2026))
+    coach.opponent_table = opponent_table
+    coach.range_tracker = range_tracker
+    try:
+        view = state.view_for(hero.id)
+        return coach.decide(view)
+    except Exception:
+        return None
 
 
 def _build_brain_html(*, hero, hand_label, made_hand, eq_random, eq_range,
                       pot, to_call, required_eq, edge, texture_label, spr,
                       eff_stack, primary_opp, primary_opp_stats, range_info,
-                      fold_eq, state, pos) -> str:
+                      fold_eq, state, pos, coach_action) -> str:
     eq_main = eq_range if eq_range is not None else eq_random
     eq_main_color = "positive" if eq_main >= 55 else ("negative" if eq_main < 35 else "")
     edge_str = ""
@@ -285,7 +308,10 @@ def _build_brain_html(*, hero, hand_label, made_hand, eq_random, eq_range,
 </div>
 '''
 
-    # Action buttons
+    # Coach suggestion + action buttons
+    suggestion_html = _render_suggestion(coach_action, state, hero,
+                                          eq_main_color, eq_range, eq_random,
+                                          required_eq, fold_eq)
     actions_html = _render_action_ui(state, hero)
 
     return (
@@ -314,9 +340,90 @@ def _build_brain_html(*, hero, hand_label, made_hand, eq_random, eq_range,
   {explainer("SPR &amp; texture", "<p><em>SPR</em> (Stack-to-Pot Ratio) tells you how committed you are. SPR &lt; 2 = play for stacks. SPR &gt; 6 = deep, careful with one pair.</p><p><em>Texture</em> shapes optimal sizing. Wet boards (draws everywhere) → bigger bets to charge them. Dry boards → smaller probing bets.</p>", "spr")}
 </div>
 {fold_eq_block}
+{suggestion_html}
 {actions_html}
 '''
     )
+
+
+def _render_suggestion(
+    coach_action: Optional[Action],
+    state: HandState,
+    hero: Player,
+    eq_main_color: str,
+    eq_range: Optional[float],
+    eq_random: float,
+    required_eq: float,
+    fold_eq: Optional[float],
+) -> str:
+    if coach_action is None:
+        return ""
+
+    action_label, reason = _label_and_reason(
+        coach_action, state, hero, eq_range, eq_random, required_eq, fold_eq,
+    )
+
+    # Apply-this-suggestion form (one-click submit of the same action)
+    apply_form = (
+        '<form class="apply-suggestion" hx-post="/act" hx-target="#main" hx-swap="innerHTML">'
+        f'<input type="hidden" name="action_type" value="{coach_action.type.value}">'
+        f'<input type="hidden" name="amount" value="{coach_action.amount}">'
+        '<button class="action-btn apply" type="submit">Apply ↵</button>'
+        '</form>'
+    )
+
+    return f'''
+<div class="suggestion">
+  <div class="suggestion-label">SUGGESTED · TAG COACH</div>
+  <div class="suggestion-action">{action_label}</div>
+  <div class="suggestion-reason">{reason}</div>
+  <div class="suggestion-cta">{apply_form}</div>
+</div>
+'''
+
+
+def _label_and_reason(
+    action: Action,
+    state: HandState,
+    hero: Player,
+    eq_range: Optional[float],
+    eq_random: float,
+    required_eq: float,
+    fold_eq: Optional[float],
+) -> tuple[str, str]:
+    """Build a human-readable label and one-line reason for the coach's action."""
+    eq_main = eq_range if eq_range is not None else eq_random
+    eq_label = f"{eq_main:.0f}%" + (" vs range" if eq_range is not None else " vs random")
+
+    if action.type == ActionType.FOLD:
+        if state.current_bet > 0:
+            return ("FOLD",
+                    f"Equity ({eq_main:.0f}%) below break-even ({required_eq:.0f}%) "
+                    f"and not enough fold equity to bluff-raise.")
+        return ("FOLD", f"Equity ({eq_main:.0f}%) too thin to continue.")
+
+    if action.type == ActionType.CHECK:
+        return ("CHECK",
+                f"Equity {eq_label}; pot control. Marginal hand on this street.")
+
+    if action.type == ActionType.CALL:
+        return (f"CALL ${action.amount:.2f}",
+                f"Equity {eq_label} clears the {required_eq:.0f}% threshold; +EV call.")
+
+    if action.type == ActionType.BET:
+        size = action.amount
+        if eq_main >= 55:
+            return (f"BET ${size:.2f}", f"Equity {eq_label} → value bet for protection and thin value.")
+        if fold_eq is not None and fold_eq >= 40:
+            return (f"BET ${size:.2f}",
+                    f"Fold equity ~{fold_eq:.0f}% makes a bluff +EV even with weak equity ({eq_main:.0f}%).")
+        return (f"BET ${size:.2f}", f"Mixed bet — combination of equity ({eq_main:.0f}%) and fold equity.")
+
+    if action.type == ActionType.RAISE:
+        return (f"RAISE +${action.amount:.2f}",
+                f"Equity {eq_label} comfortably ahead of the {required_eq:.0f}% threshold; raise for value.")
+
+    return (action.type.value.upper(), "")
 
 
 def _render_action_ui(state: HandState, hero: Player) -> str:

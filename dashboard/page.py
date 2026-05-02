@@ -249,6 +249,45 @@ details.explainer summary:hover .explainer-icon { border-color: var(--paper); co
 .explainer-body p { margin: 0 0 0.5rem; }
 .explainer-body p:last-child { margin-bottom: 0; }
 
+/* Suggestion panel — TAG coach recommendation */
+.suggestion {
+  margin-top: 1.5rem;
+  padding: 1rem 1.2rem 1.1rem;
+  background: linear-gradient(135deg, rgba(199, 154, 74, 0.12), rgba(199, 154, 74, 0.03));
+  border: 1px solid rgba(199, 154, 74, 0.45);
+  border-radius: 2px;
+  position: relative;
+}
+.suggestion-label {
+  font-family: var(--mono);
+  font-size: 0.65rem;
+  letter-spacing: 2.5px;
+  color: var(--gold);
+  margin-bottom: 0.4rem;
+}
+.suggestion-action {
+  font-family: var(--serif);
+  font-weight: 600;
+  font-size: 1.7rem;
+  color: var(--paper);
+  margin-bottom: 0.4rem;
+  line-height: 1.1;
+}
+.suggestion-reason {
+  font-family: var(--serif-body);
+  font-style: italic;
+  font-size: 0.95rem;
+  color: rgba(245, 239, 226, 0.78);
+  line-height: 1.5;
+  margin-bottom: 0.7rem;
+}
+.suggestion-cta { display: flex; gap: 0.5rem; }
+.action-btn.apply {
+  background: var(--gold); color: var(--ink);
+  border: 1px solid var(--gold); font-weight: 700;
+}
+.action-btn.apply:hover { background: #d8af5e; }
+
 /* Action area */
 .action-area {
   margin-top: 1.5rem; padding-top: 1rem;
