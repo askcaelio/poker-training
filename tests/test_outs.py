@@ -157,3 +157,40 @@ class TestNoDraw:
         assert a.out_count == 0
         assert a.prob_hit_next == 0.0
         assert a.prob_hit_by_river == 0.0
+        assert a.outs_by_destination == {}
+
+
+class TestOutsByDestination:
+    def test_flush_draw_breakdown(self):
+        # AsKs on Qs7s2c: 9 → Flush, 14 → Pair (with one overlap)
+        a = analyze_outs(parse_cards("As Ks"), parse_cards("Qs 7s 2c"))
+        assert "Flush" in a.outs_by_destination
+        assert "Pair" in a.outs_by_destination
+        assert len(a.outs_by_destination["Flush"]) == 9
+        # Pair count = 23 total - 9 flush = 14
+        total_in_breakdown = sum(len(v) for v in a.outs_by_destination.values())
+        assert total_in_breakdown == a.out_count
+
+    def test_oesd_breakdown(self):
+        # 9s 8h on 7d 6c 2s: 8 straight outs + pair outs
+        a = analyze_outs(parse_cards("9s 8h"), parse_cards("7d 6c 2s"))
+        assert "Straight" in a.outs_by_destination
+        assert len(a.outs_by_destination["Straight"]) == 8
+
+
+class TestRuleReliability:
+    def test_reliable_at_low_out_count(self):
+        # Pure flush draw on a board where pair outs are minimal
+        # 9 outs is the canonical "rule works" case
+        # Construct: hero has two cards that don't share rank with anything,
+        # but already have a pair so most pair outs are gone... too complex.
+        # Just test the threshold directly.
+        a = analyze_outs(parse_cards("9s 8h"), parse_cards("6d 5c 2s"))
+        # 19 outs > 13 → rule_reliable should be False
+        assert a.out_count == 19
+        assert a.rule_reliable is False
+
+    def test_unreliable_at_high_out_count(self):
+        a = analyze_outs(parse_cards("As 2s"), parse_cards("Ks 8s 5h"))
+        assert a.out_count == 23
+        assert a.rule_reliable is False

@@ -1,19 +1,38 @@
 # poker-training
 
-A Texas Hold'em training tool focused on building **probability intuition**, not just playing hands.
+A Texas Hold'em training tool focused on building **probability intuition** —
+and a self-contained simulation engine that runs autonomously for analysis or
+ML training data.
 
-> **Status:** Phase 1 (math engine) — works end-to-end on the CLI. Multi-player
-> game flow, opponent ranges, and a GUI are on the roadmap below.
+> **Status:** Phase 1 (math engine) ✅ + Phase 2 (game flow + bots) ✅
+> Range modeling and a GUI are next on the roadmap.
+
+## What it does
+
+**Two modes, one engine:**
+
+- **`scripts/play.py`** — sit at a 6-max table against 5 bot opponents
+  with the dashboard shown for every decision you make (pot odds, equity,
+  outs, EV verdict). Build intuition by playing real hands.
+- **`scripts/simulate.py`** — autonomous bot-vs-bot simulation, dumps every
+  action and showdown to JSONL. Use the data for analysis, or train ML models
+  on hand histories.
 
 ## What it teaches
 
-- **Outs counting** — every card that improves your hand, with draw labels (Flush draw, OESD, Gutshot, overcards)
-- **Suit-specific probabilities** — "P(diamond on turn) = 9/47 = 19.1%" with the rule-of-4/2 heuristic shown alongside
-- **Equity** — Monte Carlo win/tie/lose vs random opponents (validated against textbook matchups)
-- **Pot odds & EV** — required equity vs actual equity, with a +EV / -EV / Break-even verdict and the dollar EV of the call
-- **Heads-up dashboard** — all of the above bundled into one snapshot per decision
+- **Outs counting** — every card that improves your hand, broken down by
+  destination ("9 → Flush, 14 → Pair")
+- **Suit-specific probabilities** — "P(diamond on turn) = 9/47 = 19.1%"
+  alongside the rule-of-4/2 heuristic, with a warning when the heuristic
+  diverges (>13 outs)
+- **Equity** — Monte Carlo win/tie/lose vs random opponents (validated
+  against textbook matchups: AA vs KK ≈ 81/19, AKs vs 22 ≈ 50/50)
+- **Pot odds & EV** — required equity vs actual equity, with a verdict
+  (+EV / -EV / Break-even) and the dollar EV of the call
+- **Bot reading** — opponents have explicit personalities you can study:
+  Nit (~7% VPIP), TAG (~20%), LAG (~30%), Maniac (~50%), Station (~85%)
 
-## Sample output
+## Sample dashboard
 
 ```
 ════════════════════════════════════════════════════════════
@@ -24,7 +43,8 @@ A Texas Hold'em training tool focused on building **probability intuition**, not
  Made hand:    High Card
  Draws:        Flush draw, 2 overcards
  Outs:         23 of 47 unseen   P(any improvement next: 48.9%, by river: 74.5%)
- Rule of 4/2:  92% (heuristic)
+ Breakdown:    9→Flush | 14→Pair
+ Rule of 4/2:  92% (heuristic)  ⚠ unreliable above ~13 outs
  Flush draw ♦:  9 diamonds left  P(next: 19.1%, by river: 35.0%)
  Equity:       win 72.7%  tie 0.7%  lose 26.6%  → 73.0% (10,000 iters)
 ════════════════════════════════════════════════════════════
@@ -33,6 +53,26 @@ A Texas Hold'em training tool focused on building **probability intuition**, not
  EV:           +$59.57   →   +EV call
 ════════════════════════════════════════════════════════════
 ```
+
+## Sample simulation output
+
+500-hand, 6-handed mixed table:
+
+```
+Sim: 500 hands
+
+  player          hands   VPIP    PFR   won/hand   BB/100
+  ───────────────────────────────────────────────────────
+  LAG_1             500  30.0%  21.0%      4.77   +476.6
+  Maniac_1          500  55.0%  31.5%     -5.68   -568.1
+  Nit_1             500   8.0%   5.5%      2.71   +270.9
+  Station_1         500  84.5%   1.5%     -6.95   -695.3
+  TAG_1             500  17.0%   9.5%      0.13    +13.2
+  TAG_2             500  22.5%  15.5%      5.03   +502.8
+```
+
+Stations limp wide and bleed chips. TAGs play tight-aggressive and crush.
+The numbers tell the right story.
 
 ## Layout
 
@@ -44,10 +84,15 @@ src/poker/
   outs.py        # outs counter, suit-specific draw probabilities
   pot_odds.py    # pot odds, required equity, EV, +EV/-EV verdict
   dashboard.py   # assembles the heads-up display
+  game.py        # game state machine: Player, Action, Pot, HandState, side pots
+  agents.py      # Agent abstraction + 5 bot archetypes (Nit/TAG/LAG/Maniac/Station)
+  simulator.py   # multi-hand runner, JSONL dump, aggregate stats
 scripts/
   demo_diamonds.py   # the classic flush-draw probability question
   walkthrough.py     # full hand street-by-street with the dashboard each street
-tests/             # pytest, validates against published equity values
+  play.py            # interactive: you vs 5 bots, dashboard each decision
+  simulate.py        # autonomous: N hands of bot vs bot, JSONL dump + stats
+tests/             # 172 tests, validates against textbook matchups
 ```
 
 ## Setup
@@ -56,23 +101,39 @@ Requires Python 3.12+. Uses [uv](https://github.com/astral-sh/uv) for env manage
 
 ```bash
 uv sync
-uv run pytest                          # 125 tests
-uv run python scripts/walkthrough.py   # see the dashboard in action
+uv run pytest                              # 172 tests
+uv run python scripts/walkthrough.py       # see the dashboard in action
+uv run python scripts/play.py 50           # play 50 hands vs the bots
+uv run python scripts/simulate.py 1000     # 1000-hand bot-vs-bot sim → JSONL
 ```
 
 ## Roadmap
 
-**Phase 1 — math engine (current)** — done
-**Phase 2 — game flow** — multi-player loop with persistent stacks, betting rounds, side pots, ability to introduce new players mid-session, and bot personalities (TAG / LAG / nit / maniac / station) with explicit bluff frequencies. Goal: actually playable as a long-form trainer.
-**Phase 3 — ranges** — 13×13 hand-grid range model, range narrowing as villains act, equity vs ranges (not just random hands). The bridge from "math problem" to "real poker thinking."
-**Phase 4 — GUI** — likely SwiftUI for the iOS path. Pygame considered for prototyping only.
+- **Phase 1 — math engine** ✅
+- **Phase 2 — game flow + bots + simulator** ✅
+- **Phase 3 — ranges** — 13×13 hand-grid model, range narrowing as villains
+  act, equity vs ranges (not just random). Closes the realistic-equity gap
+  between random opponents and ones who are actually betting.
+- **Phase 4 — speed pass** — switch to a faster evaluator (phevaluator), or
+  vectorize the Monte Carlo loop with numpy. Currently ~65ms/hand — fine for
+  thousands of hands, slow for hundreds of thousands.
+- **Phase 5 — GUI** — likely SwiftUI for the iOS path.
 
 ## Design notes
 
-- **Engine is UI-agnostic** — `Dashboard`, `DrawAnalysis`, `Equity`, `PotOddsAnalysis` are clean dataclasses ready to feed any frontend.
-- **Outs are category changes**, not just kicker bumps. "Pair from high card" counts; "better kicker on the same pair" doesn't.
-- **Equity is Monte Carlo** at 10–30k iterations (≈1% precision). Validated against well-known matchups: AA vs KK ≈ 81/19, AKs vs 22 ≈ 50/50, AKo vs QQ ≈ 43/57.
-- **Bot personalities over GTO** — for a *trainer*, learning to read player types beats learning to play unexploitable. Solvers are a separate problem.
+- **Engine is UI-agnostic** — `Dashboard`, `HandView`, `Action` are clean
+  dataclasses ready to feed any frontend.
+- **Same engine, two modes** — `Agent` is an abstract decision-maker. The
+  interactive `HumanAgent` prompts via stdin; the bots decide programmatically.
+  Both share the game state machine.
+- **Outs are category changes**, not just kicker bumps. "Pair from high card"
+  counts; "better kicker on the same pair" doesn't.
+- **Equity is Monte Carlo** — bots use 800 iterations (~3% precision); demo
+  scripts use 10-20k for tighter numbers.
+- **Bot personalities over GTO** — for a *trainer*, learning to read player
+  types beats learning to play unexploitable. Solvers are a separate problem.
+- **JSONL output** captures every action, hole cards, board, and side pot,
+  ready for analysis or ML training.
 
 ## Acknowledgments
 

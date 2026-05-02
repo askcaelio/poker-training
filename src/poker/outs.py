@@ -35,19 +35,24 @@ class DrawAnalysis:
     Attributes:
         outs:               cards that improve hero's hand category
         out_count:          number of outs
+        outs_by_destination:  {destination_category: tuple of cards} — splits outs
+                              by what category they make ("Flush", "Pair", "Two Pair", etc.)
         unseen:             total unseen cards (47 on flop, 46 on turn)
         prob_hit_next:      exact P(any out on the very next card)
         prob_hit_by_river:  exact P(at least one out by the river)
         rule_of_4_or_2:     heuristic estimate (rule of 4 from flop, rule of 2 from turn)
+        rule_reliable:      false when out_count > ~13; rule of 4 noticeably overestimates
         labels:             human-readable draw types ("Flush draw", "OESD", "Gutshot", etc.)
     """
 
     outs: tuple[Card, ...]
     out_count: int
+    outs_by_destination: dict[str, tuple[Card, ...]]
     unseen: int
     prob_hit_next: float
     prob_hit_by_river: float
     rule_of_4_or_2: float
+    rule_reliable: bool
     labels: tuple[str, ...] = field(default_factory=tuple)
 
     def __str__(self) -> str:
@@ -59,6 +64,20 @@ class DrawAnalysis:
             f"(rule estimate: {self.rule_of_4_or_2 * 100:.0f}%)"
             f"{label_str}"
         )
+
+    def breakdown(self) -> str:
+        """Multi-line breakdown of outs by destination category."""
+        if not self.outs_by_destination:
+            return "(no outs)"
+        lines = []
+        # Show strongest categories first (Flush before Pair, etc.)
+        order = ["Royal Flush", "Straight Flush", "Four of a Kind", "Full House",
+                 "Flush", "Straight", "Three of a Kind", "Two Pair", "Pair"]
+        for cat in order:
+            if cat in self.outs_by_destination:
+                cards = self.outs_by_destination[cat]
+                lines.append(f"  {len(cards):>2} to {cat}")
+        return "\n".join(lines)
 
 
 def analyze_outs(hole: Iterable[Card], board: Iterable[Card]) -> DrawAnalysis:
@@ -82,6 +101,7 @@ def analyze_outs(hole: Iterable[Card], board: Iterable[Card]) -> DrawAnalysis:
 
     current = evaluate(hole, board)
     outs: list[Card] = []
+    by_dest: dict[str, list[Card]] = {}
     for c in unseen_cards:
         improved = evaluate(hole, board + [c])
         # An "out" is a category change (e.g., high card → pair, pair → flush).
@@ -89,6 +109,7 @@ def analyze_outs(hole: Iterable[Card], board: Iterable[Card]) -> DrawAnalysis:
         # Lower category_index = stronger category (treys convention).
         if improved.category_index < current.category_index:
             outs.append(c)
+            by_dest.setdefault(improved.category, []).append(c)
 
     out_count = len(outs)
 
@@ -105,15 +126,21 @@ def analyze_outs(hole: Iterable[Card], board: Iterable[Card]) -> DrawAnalysis:
         prob_by_river = prob_next
         rule = out_count * 2 / 100.0
 
+    # Rule of 4/2 was designed for ~8-9 outs (flush/straight draws). Above ~13
+    # outs the linear approximation deviates noticeably from the exact value.
+    rule_reliable = out_count <= 13
+
     labels = _label_draws(hole, board, outs)
 
     return DrawAnalysis(
         outs=tuple(outs),
         out_count=out_count,
+        outs_by_destination={k: tuple(v) for k, v in by_dest.items()},
         unseen=unseen_count,
         prob_hit_next=prob_next,
         prob_hit_by_river=prob_by_river,
         rule_of_4_or_2=rule,
+        rule_reliable=rule_reliable,
         labels=tuple(labels),
     )
 

@@ -149,7 +149,18 @@ def render(d: Dashboard) -> str:
             f"P(any improvement next: {a.prob_hit_next * 100:.1f}%, "
             f"by river: {a.prob_hit_by_river * 100:.1f}%)"
         )
-        lines.append(f" Rule of 4/2:  {a.rule_of_4_or_2 * 100:.0f}% (heuristic)")
+        # Breakdown by destination category — much more pedagogical than a single number
+        if a.outs_by_destination:
+            order = ["Flush", "Straight", "Three of a Kind", "Two Pair", "Pair",
+                     "Full House", "Four of a Kind", "Straight Flush", "Royal Flush"]
+            parts = []
+            for cat in order:
+                if cat in a.outs_by_destination:
+                    parts.append(f"{len(a.outs_by_destination[cat])}→{cat}")
+            if parts:
+                lines.append(f" Breakdown:    {' | '.join(parts)}")
+        rule_note = "" if a.rule_reliable else "  ⚠ unreliable above ~13 outs"
+        lines.append(f" Rule of 4/2:  {a.rule_of_4_or_2 * 100:.0f}% (heuristic){rule_note}")
 
     # Suit-specific (flush draws only)
     for sd in d.suit_draws:
