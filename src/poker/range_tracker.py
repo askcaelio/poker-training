@@ -24,8 +24,9 @@ from typing import Optional
 from .archetype_ranges import (
     call_open_range, call_threebet_range, open_range, threebet_range,
 )
+from .cards import Card
 from .opponent_model import OpponentTable, OpponentStats
-from .range_model import Range
+from .range_model import Range, classify_combo_on_board, expand_combos
 
 
 def _classify_archetype(stats: OpponentStats) -> str:
@@ -78,8 +79,13 @@ class RangeTracker:
         street: str,         # "preflop", "flop", "turn", "river"
         is_facing_raise: bool,
         is_threebet_situation: bool = False,
+        board: Optional[list[Card]] = None,
     ) -> None:
-        """Update opponent's range based on observed action."""
+        """Update opponent's range based on observed action.
+
+        For postflop actions, requires `board` to classify hands as
+        made/draw/air on this specific board.
+        """
         if opponent_id not in self.ranges:
             return  # not tracking this opponent
         archetype = self.archetype_by_id.get(opponent_id, "TAG")
@@ -90,10 +96,12 @@ class RangeTracker:
             return
 
         if street != "preflop":
-            # Postflop: simple narrowing — calls keep "made hand or draw" hands;
-            # raises keep "strong made hands or bluffs". We're not analyzing
-            # board texture yet, so use a coarse approximation: don't narrow
-            # postflop in v1. Future: detect pairs/draws/air on the board.
+            # Postflop narrowing — needs the board
+            if board is None or len(board) < 3:
+                return
+            self.ranges[opponent_id] = _narrow_postflop(
+                self.ranges[opponent_id], board, action_type, archetype,
+            )
             return
 
         # Preflop narrowing rules per action type
@@ -119,3 +127,71 @@ class RangeTracker:
 
     def get(self, opponent_id: str) -> Optional[Range]:
         return self.ranges.get(opponent_id)
+
+
+def _narrow_postflop(
+    rng_range: Range,
+    board: list[Card],
+    action_type: str,
+    archetype: str,
+) -> Range:
+    """Compute a new range after observing a postflop action.
+
+    Per-class weighting strategy: for each hand class in the range, compute
+    the average "stay weight" across all its combos (after excluding board
+    cards) based on their strength on this board.
+
+    - 'call' or 'bet': made hands (pair+) stay at full weight; strong draws
+      stay at full weight; weak draws stay at partial weight; air drops out.
+    - 'raise': only strong made hands (two pair+) stay at full weight;
+      pair stays at partial weight; strong draws stay at partial weight
+      (semi-bluffs); air gets a small "bluff" weight.
+
+    Different archetypes have different bluff frequencies, but for v1 we
+    use a single rule with mild archetype variation.
+    """
+    bluff_weight_by_archetype = {
+        "Nit": 0.0, "TAG": 0.10, "LAG": 0.20, "Maniac": 0.40, "Station": 0.0,
+    }
+    bluff_w = bluff_weight_by_archetype.get(archetype, 0.10)
+
+    if action_type in ("call", "bet"):
+        weight_map = {
+            "made_strong": 1.0,
+            "made_pair": 1.0,
+            "strong_draw": 1.0,
+            "weak_draw": 0.5,
+            "air": 0.0,
+        }
+    elif action_type == "raise":
+        weight_map = {
+            "made_strong": 1.0,
+            "made_pair": 0.4,
+            "strong_draw": 0.5,    # semi-bluffs
+            "weak_draw": 0.1,
+            "air": bluff_w,        # pure bluffs (varies by archetype)
+        }
+    else:
+        # Includes 'check' — don't narrow on checks (too noisy at this fidelity)
+        return rng_range
+
+    board_set = set(board)
+    new_weights: dict[str, float] = {}
+    for hand_class, base_w in rng_range.weights.items():
+        if base_w <= 0:
+            continue
+        # Average across non-blocked combos for this class
+        combos = expand_combos(hand_class)
+        usable = [combo for combo in combos if not any(c in board_set for c in combo)]
+        if not usable:
+            continue
+        total_keep = 0.0
+        for combo in usable:
+            cls = classify_combo_on_board(combo, board)
+            total_keep += weight_map.get(cls, 0.0)
+        avg_keep = total_keep / len(usable)
+        new_w = base_w * avg_keep
+        if new_w > 0.01:    # drop hands with negligible weight
+            new_weights[hand_class] = new_w
+
+    return Range(new_weights)

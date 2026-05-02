@@ -162,6 +162,7 @@ def play_one_hand(
                     street=applied.street.value,
                     is_facing_raise=is_facing_raise,
                     is_threebet_situation=is_threebet,
+                    board=list(state.board),
                 )
 
     awards = award_pots(state)

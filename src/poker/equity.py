@@ -267,6 +267,116 @@ def equity_vs_range(
     return _build_equity(wins, ties, losses, 2, iterations)
 
 
+def equity_vs_ranges(
+    hole: Iterable[Card],
+    opponent_ranges: list[Range],
+    board: Iterable[Card] = (),
+    iterations: int = 5_000,
+    rng: random.Random | None = None,
+) -> Equity:
+    """Hero's equity vs N opponents, each with their own inferred range.
+
+    For each iter:
+      1. Sample one combo per opponent (drawn from their range, weighted by
+         combo count × range weight, with no card conflicts).
+      2. Deal remaining board cards.
+      3. Evaluate hero vs each opponent; tally win/tie/lose.
+
+    Falls back to a tie if all sampling attempts fail (rare; happens when
+    ranges are extremely tight + heavily blocker-conflicted).
+    """
+    hole = list(hole)
+    board = list(board)
+    if len(hole) != 2:
+        raise ValueError(f"hero needs exactly 2 hole cards, got {len(hole)}")
+    if len(board) not in (0, 3, 4, 5):
+        raise ValueError(f"board must have 0/3/4/5 cards, got {len(board)}")
+    if not opponent_ranges:
+        raise ValueError("need at least one opponent range")
+
+    known = _validate_no_duplicates(hole, board)
+    rng = rng if rng is not None else random.Random()
+
+    # Pre-build (combos, weights, treys_combos) per opponent, excluding hero+board cards
+    per_opp_combos: list[list[tuple[Card, Card]]] = []
+    per_opp_weights: list[list[float]] = []
+    per_opp_treys: list[list[list[int]]] = []
+    for r in opponent_ranges:
+        weighted = sample_combos_from_range(r, known)
+        if not weighted:
+            # Empty range after blockers — treat as random
+            return equity_vs_random(
+                hole, board, num_opponents=len(opponent_ranges),
+                iterations=iterations, rng=rng,
+            )
+        combos, weights = zip(*weighted)
+        per_opp_combos.append(list(combos))
+        per_opp_weights.append(list(weights))
+        per_opp_treys.append([_to_treys(c) for c in combos])
+
+    treys_hole = _to_treys(hole)
+    treys_board = _to_treys(board)
+    treys_full_deck = _to_treys(c for c in full_deck() if c not in known)
+
+    board_to_draw = 5 - len(board)
+    sample = rng.sample
+    choices = rng.choices
+    evaluate_fn = _TREYS_EVALUATE
+
+    wins = ties = losses = 0
+    for _ in range(iterations):
+        # Sample one combo per opponent without conflicts.
+        used: set[int] = set(treys_hole) | set(treys_board)
+        opp_holes: list[list[int]] = []
+        ok = True
+        for i in range(len(opponent_ranges)):
+            # Try a few times; if no non-conflicting combo found, give up this iter
+            picked = None
+            for _try in range(8):
+                cand_idx = choices(range(len(per_opp_treys[i])), weights=per_opp_weights[i], k=1)[0]
+                cand = per_opp_treys[i][cand_idx]
+                if cand[0] not in used and cand[1] not in used:
+                    picked = cand
+                    break
+            if picked is None:
+                ok = False
+                break
+            opp_holes.append(picked)
+            used.add(picked[0]); used.add(picked[1])
+        if not ok:
+            continue
+
+        # Deal remaining board cards (excluding everything used so far)
+        remaining_deck = [c for c in treys_full_deck if c not in used]
+        runout = treys_board + (sample(remaining_deck, board_to_draw) if board_to_draw else [])
+
+        hero_rank = evaluate_fn(runout, treys_hole)
+        outcome = 0  # 0=win, 1=tie, 2=lose
+        for opp in opp_holes:
+            opp_rank = evaluate_fn(runout, opp)
+            if opp_rank < hero_rank:
+                outcome = 2
+                break
+            if opp_rank == hero_rank:
+                outcome = 1
+
+        if outcome == 0:
+            wins += 1
+        elif outcome == 1:
+            ties += 1
+        else:
+            losses += 1
+
+    total = wins + ties + losses
+    if total == 0:
+        # Pathological — all iterations failed sampling. Fall back to random.
+        return equity_vs_random(
+            hole, board, num_opponents=len(opponent_ranges),
+            iterations=iterations, rng=rng,
+        )
+    return _build_equity(wins, ties, losses, len(opponent_ranges) + 1, total)
+
+
 def _build_equity(wins: int, ties: int, losses: int, n_players: int, iterations: int) -> Equity:
     win_pct = 100.0 * wins / iterations
     tie_pct = 100.0 * ties / iterations

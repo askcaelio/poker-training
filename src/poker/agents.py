@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from .cards import Card, Rank
-from .equity import equity_vs_random, equity_vs_range
+from .equity import equity_vs_random, equity_vs_range, equity_vs_ranges
 from .game import Action, ActionType, HandView, Position, Street
 from .opponent_model import OpponentTable, estimate_fold_equity
 from .range_tracker import RangeTracker
@@ -257,32 +257,44 @@ class BotAgent(Agent):
     def _compute_postflop_equity(self, view: HandView, n_opps: int) -> float:
         """Pick the best equity calc for the situation.
 
-        - If we have a range tracker AND there's exactly 1 active opponent with
-          a tracked range: use equity_vs_range (more accurate).
-        - If there are multiple opponents OR no range info: fall back to
-          equity_vs_random.
-
-        Multi-way range equity is harder (need to combine ranges); skipping for v1.
+        Decision tree:
+          1. If range tracker available AND all active opponents have tracked
+             ranges → equity_vs_ranges (full multiway accuracy)
+          2. Else if heads-up AND tracked range available → equity_vs_range
+          3. Else → equity_vs_random (legacy fallback)
         """
         active = [o for o in view.others if not o.folded]
-        if (
-            self.range_tracker is not None
-            and self.config.uses_opponent_model
-            and len(active) == 1
-        ):
-            opp_id = active[0].id
-            opp_range = self.range_tracker.get(opp_id)
-            if opp_range is not None and opp_range.total_combos > 0:
+
+        if self.range_tracker is not None and self.config.uses_opponent_model and active:
+            tracked_ranges = []
+            all_have_ranges = True
+            for o in active:
+                r = self.range_tracker.get(o.id)
+                if r is None or r.total_combos == 0:
+                    all_have_ranges = False
+                    break
+                tracked_ranges.append(r)
+
+            if all_have_ranges:
                 try:
-                    return equity_vs_range(
+                    if len(tracked_ranges) == 1:
+                        return equity_vs_range(
+                            hole=list(view.your_hole),
+                            villain_range=tracked_ranges[0],
+                            board=list(view.board),
+                            iterations=self.config.equity_iters,
+                            rng=self.rng,
+                        ).equity_pct / 100.0
+                    return equity_vs_ranges(
                         hole=list(view.your_hole),
-                        villain_range=opp_range,
+                        opponent_ranges=tracked_ranges,
                         board=list(view.board),
                         iterations=self.config.equity_iters,
                         rng=self.rng,
                     ).equity_pct / 100.0
                 except ValueError:
                     pass
+
         # Fallback: equity vs random
         try:
             return equity_vs_random(

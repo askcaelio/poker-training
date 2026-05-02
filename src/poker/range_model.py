@@ -177,6 +177,59 @@ class Range:
 
 # ─── Combo expansion that excludes known cards ────────────────────────────────
 
+def classify_combo_on_board(hole: tuple[Card, Card], board: list[Card]) -> str:
+    """Classify a 2-card combo on a 3/4/5-card board.
+
+    Returns one of: 'made_strong' (two pair+), 'made_pair' (one pair),
+    'strong_draw' (flush draw or OESD), 'weak_draw' (gutshot or overcards),
+    'air' (high card with no draw).
+
+    Used by postflop range narrowing to decide which hands stay in the
+    range after a call vs a raise.
+    """
+    # Defer imports to avoid circulars (evaluator + outs both depend on cards)
+    from .evaluator import evaluate
+    from .outs import analyze_outs
+
+    if len(board) not in (3, 4, 5):
+        raise ValueError(f"board must have 3/4/5 cards, got {len(board)}")
+
+    hs = evaluate(hole, board)
+    # category_index: 0=Royal Flush ... 8=Pair, 9=High Card (treys convention)
+    if hs.category_index <= 7:    # Two Pair (7) or stronger
+        return "made_strong"
+    if hs.category_index == 8:    # Pair
+        # Distinguish overpair (pocket pair higher than top board) — those are
+        # monster value hands that should be raised, not demoted on a raise.
+        if hole[0].rank == hole[1].rank:
+            top_board = max(c.rank for c in board)
+            if hole[0].rank > top_board:
+                return "made_strong"   # overpair
+        return "made_pair"
+
+    # No pair — only consider draws if we're not on the river
+    if len(board) == 5:
+        return "air"
+
+    try:
+        draws = analyze_outs(list(hole), list(board))
+    except ValueError:
+        return "air"
+
+    # Use just the named-draw outs (flush + straight), not pair outs.
+    # We approximate by checking labels: flush draw alone = ~9, OESD = ~8.
+    has_flush_draw = "Flush draw" in draws.labels
+    has_oesd = "OESD" in draws.labels
+    has_gutshot = "Gutshot" in draws.labels
+    has_overcards = any("overcard" in lbl for lbl in draws.labels)
+
+    if has_flush_draw or has_oesd:
+        return "strong_draw"
+    if has_gutshot or has_overcards:
+        return "weak_draw"
+    return "air"
+
+
 def sample_combos_from_range(
     rng_range: "Range",
     excluded: set[Card],
