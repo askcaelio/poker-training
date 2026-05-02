@@ -5,6 +5,7 @@ description = "Texas Hold'em training tool focused on probability intuition, equ
 requires-python = ">=3.12"
 dependencies = [
     "treys>=0.1.8",
+    "flask>=3.0",
 ]
 
 [dependency-groups]
