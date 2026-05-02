@@ -190,6 +190,11 @@ class BotAgent(Agent):
         # Falls back to vs-random when no range tracker / no live opponent.
         eq = self._compute_postflop_equity(view, n_opps)
 
+        # River gets specialized polarized betting logic — value/bluff/check
+        # rather than a single equity threshold.
+        if view.street == Street.RIVER:
+            return self._decide_river(view, eq)
+
         if view.to_call == 0:
             return self._decide_unraised(view, eq)
         return self._decide_facing_bet(view, eq)
@@ -228,40 +233,116 @@ class BotAgent(Agent):
         return Action(ActionType.CHECK)
 
     def _decide_facing_bet(self, view: HandView, eq: float) -> Action:
-        """Fold, call, or raise. Uses fold equity for raise-as-bluff decisions."""
+        """Fold, call, or raise. Uses fold equity, SPR, and implied odds."""
         required_eq = view.to_call / (view.pot + view.to_call)
-        equity_edge = eq - required_eq
+        # Implied odds: drawing hands deserve a discount when stacks are deep.
+        effective_required_eq = self._apply_implied_odds(view, required_eq, eq)
+        equity_edge = eq - effective_required_eq
         raise_total = view.current_bet + view.pot * 1.0
 
-        # Strong hand → raise for value (with fold-eq blending the EV when available)
-        if equity_edge > 0.15 and self.rng.random() < self.config.aggression:
-            return self._raise_to(view, raise_total)
+        spr = self._spr(view)
 
-        # Marginal but priced-in → call
+        # SPR-aware adjustments:
+        # Low SPR (committed) → wider raises and calls; one-pair is enough to commit
+        # High SPR (deep) → tighter raises (don't get one-pair stacks in)
+        if spr < 2.0:
+            # Committed — get it in with anything decent
+            if eq > effective_required_eq:
+                return self._raise_to(view, raise_total)
+        elif spr > 6.0 and view.street != Street.RIVER:
+            # Deep — only raise with strong hands
+            if equity_edge > 0.25 and self.rng.random() < self.config.aggression:
+                return self._raise_to(view, raise_total)
+        else:
+            # Standard SPR
+            if equity_edge > 0.15 and self.rng.random() < self.config.aggression:
+                return self._raise_to(view, raise_total)
+
+        # Marginal but priced-in (or implied-priced-in) → call
         if equity_edge > self.config.fold_threshold_buffer:
             return self._call_or_check(view)
 
         # Weak hand below pot odds → fold or bluff-raise.
-        # Bluff-raise EV requires significant fold equity vs the bettor.
         if self.opponent_table is not None and self.config.uses_opponent_model:
-            # Find the bettor — heuristic: the most recent aggressor in this round
             bettor_id = self._last_aggressor_id(view)
             if bettor_id is not None:
                 fold_eq = estimate_fold_equity(
                     bettor_id, self.opponent_table, context="barrel",
                 )
-                # Bluff-raise EV: roughly fold_eq * (pot + their_bet) - bet_cost
-                # Required fold_eq for breakeven: bet_cost / (bet_cost + pot)
                 bet_cost = raise_total - view.your_bet_this_round
                 required_fold_eq = bet_cost / (bet_cost + view.pot + view.to_call)
                 if fold_eq > required_fold_eq + 0.05:
                     return self._raise_to(view, raise_total)
             return Action(ActionType.FOLD)
 
-        # No opponent model — fall back to random bluff frequency
         if self.rng.random() < self.config.bluff_freq:
             return self._raise_to(view, raise_total)
         return Action(ActionType.FOLD)
+
+    # ─── River: polarized value vs bluff ────────────────────────────────────
+
+    def _decide_river(self, view: HandView, eq: float) -> Action:
+        """River-specific polarized logic: value bet very strong, bluff very
+        weak (with fold equity), check the middle (showdown value)."""
+        if view.to_call > 0:
+            # Facing a bet on the river — call only with bluff catchers or better
+            return self._decide_facing_bet(view, eq)
+
+        # No bet to face — either bet (value or bluff) or check
+        bet_size = view.pot * self._sizing_for_board(view) * 1.1  # river often larger
+
+        # Value zone: very strong hands → bet for value
+        if eq >= 0.75:
+            return self._bet(view, bet_size)
+
+        # Bluff zone: very weak hands with fold equity → bluff
+        if eq < 0.20 and self.opponent_table is not None and self.config.uses_opponent_model:
+            fold_eq = self._avg_fold_equity(view, context="barrel")
+            # Bluff breakeven: fold_eq > bet / (bet + pot)
+            required_fold_eq = bet_size / (bet_size + view.pot)
+            if fold_eq > required_fold_eq + 0.05:
+                return self._bet(view, bet_size)
+
+        # Middle: showdown value — check it down
+        return Action(ActionType.CHECK)
+
+    # ─── SPR + implied odds ─────────────────────────────────────────────────
+
+    def _spr(self, view: HandView) -> float:
+        """Stack-to-Pot Ratio: effective stack ÷ pot.
+
+        Effective stack = min(your remaining stack, deepest active villain's stack).
+        Low SPR (< 2): committed. Standard (2-6): play normally. Deep (> 6): careful.
+        """
+        if view.pot <= 0:
+            return 99.0
+        active_villain_stacks = [o.stack for o in view.others if not o.folded]
+        if not active_villain_stacks:
+            return 99.0
+        effective = min(view.your_stack, max(active_villain_stacks))
+        return effective / view.pot
+
+    def _apply_implied_odds(
+        self, view: HandView, required_eq: float, eq: float,
+    ) -> float:
+        """Adjust the required equity downward when we have a clear draw and
+        deep stacks behind. Implied odds = "we'll win more on later streets."
+        """
+        # Only adjusts on flop/turn (river has no implied odds)
+        if view.street == Street.RIVER or not view.board:
+            return required_eq
+        spr = self._spr(view)
+        if spr < 2.0:
+            return required_eq   # no implied — already committed
+        # Detect "drawing" hand: low equity but with enough to be a real draw
+        # Threshold heuristic: 25-45% equity = likely a draw, not a made hand
+        is_drawing = 0.25 <= eq <= 0.45
+        if not is_drawing:
+            return required_eq
+        # Implied factor: deeper stacks = bigger discount, capped
+        implied_factor = min(spr * 0.05, 0.15)   # at SPR=10: 0.05*10=0.5, capped to 0.15
+        # Discount required equity by the implied factor
+        return required_eq * (1 - implied_factor)
 
     def _compute_postflop_equity(self, view: HandView, n_opps: int) -> float:
         """Pick the best equity calc for the situation.

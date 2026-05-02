@@ -7,8 +7,9 @@ ML training data.
 > **Status:** Phase 1 (math engine) ✅ + Phase 2 (game flow + bots) ✅ +
 > Phase 2.5 (opponent modeling + fold equity) ✅ + Phase 3 (range modeling
 > with combo-level weights + postflop narrowing + multiway) ✅ +
-> Phase 3.5 (texture-aware sizing + position-aware ranges) ✅
-> A GUI is next on the roadmap.
+> Phase 3.5 (texture-aware sizing + position-aware ranges) ✅ +
+> Phase 3.6 (SPR + implied odds + polarized river) ✅
+> Speed pass and a GUI are next on the roadmap.
 
 ## What it does
 
@@ -107,7 +108,7 @@ scripts/
   simulate.py        # autonomous: N hands of bot vs bot, JSONL dump + stats
   narrate.py         # one hand from a chosen POV with full annotations
   compare_models.py  # A/B test: with vs without opponent modeling
-tests/             # 235 tests, validates against textbook matchups
+tests/             # 245 tests, validates against textbook matchups
 ```
 
 ## Setup
@@ -116,7 +117,7 @@ Requires Python 3.12+. Uses [uv](https://github.com/astral-sh/uv) for env manage
 
 ```bash
 uv sync
-uv run pytest                              # 235 tests
+uv run pytest                              # 245 tests
 uv run python scripts/walkthrough.py       # see the dashboard in action
 uv run python scripts/play.py 50           # play 50 hands vs the bots
 uv run python scripts/simulate.py 1000     # 1000-hand bot-vs-bot sim → JSONL
@@ -146,6 +147,13 @@ uv run python scripts/simulate.py 1000     # 1000-hand bot-vs-bot sim → JSONL
   texture (wet boards get bigger bets to charge draws, dry boards get
   smaller probing bets); position-aware preflop ranges (UTG/MP play
   tighter, BTN plays full range, BB defends wide vs raises)
+- **Phase 3.6 — SPR, implied odds, polarized river** ✅
+  - SPR-aware decisions: bot at SPR < 2 commits with anything decent;
+    at SPR > 6 (deep) only raises with strong hands
+  - Implied odds: drawing hands get a discount on required equity when
+    stacks are deep (you'll win more on later streets)
+  - Polarized river: very strong hands value-bet, very weak hands bluff
+    (with fold equity), middle-strength hands check for showdown value
 - **Phase 4 — speed pass** — switch to a faster evaluator (phevaluator), or
   vectorize the Monte Carlo loop with numpy.
 - **Phase 5 — GUI** — likely SwiftUI for the iOS path.
