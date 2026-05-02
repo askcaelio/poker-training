@@ -27,9 +27,10 @@ from dataclasses import dataclass
 from typing import Optional
 
 from .cards import Card, Rank
-from .equity import equity_vs_random
+from .equity import equity_vs_random, equity_vs_range
 from .game import Action, ActionType, HandView, Position, Street
 from .opponent_model import OpponentTable, estimate_fold_equity
+from .range_tracker import RangeTracker
 
 
 # ─── Hand class strings ───────────────────────────────────────────────────────
@@ -64,49 +65,11 @@ def _suited(min_high: str, min_low: str = "2") -> list[str]:
     return out
 
 
-# Explicit ranges. These are textbook approximations, not GTO.
-NIT_RANGE: set[str] = {
-    "AA", "KK", "QQ", "JJ", "TT", "99",
-    "AKs", "AKo", "AQs", "AQo", "AJs",
-    "KQs",
-}  # ~6% of hands
-
-TAG_RANGE: set[str] = NIT_RANGE | {
-    "88", "77", "66", "55", "44", "33", "22",
-    "AJo", "ATs", "ATo", "A9s", "A8s", "A7s", "A6s", "A5s", "A4s", "A3s", "A2s",
-    "KQo", "KJs", "KJo", "KTs", "K9s",
-    "QJs", "QJo", "QTs", "Q9s",
-    "JTs", "J9s",
-    "T9s", "T8s",
-    "98s", "97s", "87s", "86s", "76s", "75s", "65s", "54s",
-}  # ~18-20%
-
-LAG_RANGE: set[str] = TAG_RANGE | {
-    "K8s", "K7s", "K6s", "K5s", "K4s", "K3s", "K2s",
-    "Q8s", "Q7s", "Q6s", "Q5s",
-    "J8s", "J7s",
-    "T7s", "T6s",
-    "96s", "85s", "74s", "64s", "53s", "43s",
-    "ATo", "K9o", "Q9o", "J9o", "T9o", "98o", "87o", "76o",
-}  # ~30-32%
-
-MANIAC_RANGE: set[str] = LAG_RANGE | {
-    "Q4s", "Q3s", "Q2s", "J6s", "J5s", "J4s", "J3s", "J2s",
-    "T5s", "T4s", "T3s", "T2s",
-    "95s", "94s", "93s", "92s", "84s", "83s", "82s", "73s", "72s",
-    "63s", "62s", "52s", "42s", "32s",
-    "K8o", "K7o", "K6o", "Q8o", "Q7o", "J8o", "T8o", "97o", "86o", "75o", "65o", "54o",
-}  # ~50%
-
-# Station plays almost everything (just folds the worst trash if facing a big bet)
-STATION_RANGE: set[str] = MANIAC_RANGE | {
-    "K5o", "K4o", "K3o", "K2o", "Q6o", "Q5o", "Q4o", "Q3o", "Q2o",
-    "J7o", "J6o", "J5o", "J4o", "J3o", "J2o",
-    "T7o", "T6o", "T5o", "T4o", "T3o", "T2o",
-    "96o", "95o", "94o", "93o", "92o",
-    "85o", "84o", "83o", "82o", "74o", "73o", "72o",
-    "64o", "63o", "62o", "53o", "52o", "42o", "32o",
-}  # ~85%
+# Range definitions live in preflop_ranges.py to break circular imports.
+# Re-exported here for backward compatibility.
+from .preflop_ranges import (
+    LAG_RANGE, MANIAC_RANGE, NIT_RANGE, STATION_RANGE, TAG_RANGE,
+)
 
 
 # ─── Agent base class ─────────────────────────────────────────────────────────
@@ -157,6 +120,7 @@ class BotAgent(Agent):
         config: BotConfig,
         rng: Optional[random.Random] = None,
         opponent_table: Optional[OpponentTable] = None,
+        range_tracker: Optional[RangeTracker] = None,
     ):
         self.name = name
         self.config = config
@@ -164,6 +128,10 @@ class BotAgent(Agent):
         # Opponent stats for fold-equity-aware decisions. Optional — when None,
         # bot falls back to the simpler bluff_freq / value_threshold logic.
         self.opponent_table = opponent_table
+        # Per-hand range tracker. The simulator resets this each hand and
+        # narrows ranges on each action. When present, postflop equity is
+        # computed against the inferred range, not random.
+        self.range_tracker = range_tracker
 
     def decide(self, view: HandView) -> Action:
         if view.street == Street.PREFLOP:
@@ -208,18 +176,10 @@ class BotAgent(Agent):
     # ─── Postflop ──────────────────────────────────────────────────────────
 
     def _decide_postflop(self, view: HandView) -> Action:
-        # Compute equity vs random opponents (cheap MC)
         n_opps = max(1, view.num_active_opponents)
-        try:
-            eq = equity_vs_random(
-                hole=list(view.your_hole),
-                board=list(view.board),
-                num_opponents=n_opps,
-                iterations=self.config.equity_iters,
-                rng=self.rng,
-            ).equity_pct / 100.0
-        except ValueError:
-            eq = 0.0
+        # Prefer equity vs the most-aggressive active opponent's INFERRED range.
+        # Falls back to vs-random when no range tracker / no live opponent.
+        eq = self._compute_postflop_equity(view, n_opps)
 
         if view.to_call == 0:
             return self._decide_unraised(view, eq)
@@ -293,6 +253,47 @@ class BotAgent(Agent):
         if self.rng.random() < self.config.bluff_freq:
             return self._raise_to(view, raise_total)
         return Action(ActionType.FOLD)
+
+    def _compute_postflop_equity(self, view: HandView, n_opps: int) -> float:
+        """Pick the best equity calc for the situation.
+
+        - If we have a range tracker AND there's exactly 1 active opponent with
+          a tracked range: use equity_vs_range (more accurate).
+        - If there are multiple opponents OR no range info: fall back to
+          equity_vs_random.
+
+        Multi-way range equity is harder (need to combine ranges); skipping for v1.
+        """
+        active = [o for o in view.others if not o.folded]
+        if (
+            self.range_tracker is not None
+            and self.config.uses_opponent_model
+            and len(active) == 1
+        ):
+            opp_id = active[0].id
+            opp_range = self.range_tracker.get(opp_id)
+            if opp_range is not None and opp_range.total_combos > 0:
+                try:
+                    return equity_vs_range(
+                        hole=list(view.your_hole),
+                        villain_range=opp_range,
+                        board=list(view.board),
+                        iterations=self.config.equity_iters,
+                        rng=self.rng,
+                    ).equity_pct / 100.0
+                except ValueError:
+                    pass
+        # Fallback: equity vs random
+        try:
+            return equity_vs_random(
+                hole=list(view.your_hole),
+                board=list(view.board),
+                num_opponents=n_opps,
+                iterations=self.config.equity_iters,
+                rng=self.rng,
+            ).equity_pct / 100.0
+        except ValueError:
+            return 0.0
 
     def _avg_fold_equity(self, view: HandView, context: str) -> float:
         """Average fold-equity across active opponents (those still in the hand)."""

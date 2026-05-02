@@ -5,8 +5,8 @@ and a self-contained simulation engine that runs autonomously for analysis or
 ML training data.
 
 > **Status:** Phase 1 (math engine) ✅ + Phase 2 (game flow + bots) ✅ +
-> Phase 2.5 (opponent modeling + fold equity) ✅
-> Range modeling and a GUI are next on the roadmap.
+> Phase 2.5 (opponent modeling + fold equity) ✅ + Phase 3 v1 (range modeling) ✅
+> A GUI is next on the roadmap.
 
 ## What it does
 
@@ -92,6 +92,10 @@ src/poker/
   game.py        # game state machine: Player, Action, Pot, HandState, side pots
   agents.py      # Agent abstraction + 5 bot archetypes (Nit/TAG/LAG/Maniac/Station)
   opponent_model.py  # per-opponent stats + fold-equity estimation
+  preflop_ranges.py  # raw 169-class hand sets per archetype
+  range_model.py     # weighted Range distributions + combo math
+  archetype_ranges.py  # per-archetype open/call/3bet ranges
+  range_tracker.py   # per-hand range narrowing as actions come in
   simulator.py   # multi-hand runner, JSONL dump, aggregate stats
 scripts/
   demo_diamonds.py   # the classic flush-draw probability question
@@ -100,7 +104,7 @@ scripts/
   simulate.py        # autonomous: N hands of bot vs bot, JSONL dump + stats
   narrate.py         # one hand from a chosen POV with full annotations
   compare_models.py  # A/B test: with vs without opponent modeling
-tests/             # 184 tests, validates against textbook matchups
+tests/             # 209 tests, validates against textbook matchups
 ```
 
 ## Setup
@@ -109,7 +113,7 @@ Requires Python 3.12+. Uses [uv](https://github.com/astral-sh/uv) for env manage
 
 ```bash
 uv sync
-uv run pytest                              # 172 tests
+uv run pytest                              # 209 tests
 uv run python scripts/walkthrough.py       # see the dashboard in action
 uv run python scripts/play.py 50           # play 50 hands vs the bots
 uv run python scripts/simulate.py 1000     # 1000-hand bot-vs-bot sim → JSONL
@@ -123,8 +127,13 @@ uv run python scripts/simulate.py 1000     # 1000-hand bot-vs-bot sim → JSONL
   - Bots track per-opponent VPIP/PFR/fold-to-cbet/aggression
   - Postflop decisions use fold-equity-aware EV math
   - Smart archetypes (TAG/LAG/Nit) adapt; Maniac/Station deliberately don't
-- **Phase 3 — ranges** — 13×13 hand-grid model, range narrowing as villains
-  act, equity vs ranges (not just random). Closes the realistic-equity gap.
+- **Phase 3 v1 — ranges** ✅ — weighted hand-class distributions, per-archetype
+  preflop ranges (open/call/3bet/call_3bet), `equity_vs_range()` Monte Carlo,
+  per-hand range narrowing on each preflop action. Heads-up postflop equity
+  uses inferred ranges instead of random.
+  *Limitations:* multiway pots still use vs-random; no postflop narrowing yet.
+- **Phase 3 v2 — postflop range narrowing** — when villain calls a flop bet,
+  drop air; when they raise, narrow to value+bluffs. Multiway range combination.
 - **Phase 4 — speed pass** — switch to a faster evaluator (phevaluator), or
   vectorize the Monte Carlo loop with numpy.
 - **Phase 5 — GUI** — likely SwiftUI for the iOS path.

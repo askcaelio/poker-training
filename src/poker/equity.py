@@ -28,6 +28,7 @@ from treys import Card as TreysCard
 from treys import Evaluator as TreysEvaluator
 
 from .cards import Card, full_deck
+from .range_model import Range, sample_combos_from_range
 
 _TREYS_EVAL = TreysEvaluator()
 _TREYS_EVALUATE = _TREYS_EVAL.evaluate  # bound method, faster lookup in hot loop
@@ -197,6 +198,73 @@ def equity_vs_hands(
             losses += 1
 
     return _build_equity(wins, ties, losses, n_players, iterations)
+
+
+def equity_vs_range(
+    hole: Iterable[Card],
+    villain_range: Range,
+    board: Iterable[Card] = (),
+    iterations: int = 5_000,
+    rng: random.Random | None = None,
+) -> Equity:
+    """Hero's equity against ONE opponent whose holdings are drawn from
+    `villain_range`, weighted by combo count × range weight.
+
+    For each iteration:
+      1. Sample a villain hand from the range (weighted)
+      2. Deal remaining board cards
+      3. Evaluate, count win/tie/lose
+
+    `board` may be 0/3/4/5 cards. Range hands that conflict with hole or board
+    cards are excluded from sampling.
+    """
+    hole = list(hole)
+    board = list(board)
+    if len(hole) != 2:
+        raise ValueError(f"hero needs exactly 2 hole cards, got {len(hole)}")
+    if len(board) not in (0, 3, 4, 5):
+        raise ValueError(f"board must have 0/3/4/5 cards, got {len(board)}")
+
+    known = _validate_no_duplicates(hole, board)
+    rng = rng if rng is not None else random.Random()
+
+    # Sample combos from the range, excluding cards in hero/board
+    weighted_combos = sample_combos_from_range(villain_range, known)
+    if not weighted_combos:
+        # Range is empty after excluding known cards (rare but possible)
+        return Equity(win_pct=0, tie_pct=0, lose_pct=100, equity_pct=0, iterations=0)
+
+    combos, weights = zip(*weighted_combos)
+    treys_combos = [_to_treys(c) for c in combos]
+
+    treys_hole = _to_treys(hole)
+    treys_board = _to_treys(board)
+    treys_deck = _to_treys(c for c in full_deck() if c not in known)
+
+    board_to_draw = 5 - len(board)
+    sample = rng.sample
+    choices = rng.choices  # weighted sampling
+    evaluate_fn = _TREYS_EVALUATE
+
+    wins = ties = losses = 0
+    for _ in range(iterations):
+        # Pick a villain combo (weighted by combo count × range weight)
+        opp_hole = choices(treys_combos, weights=weights, k=1)[0]
+        # Build a deck excluding villain's cards too
+        excluded = set(treys_hole) | set(treys_board) | set(opp_hole)
+        deck_iter = [c for c in treys_deck if c not in excluded]
+        runout = treys_board + (sample(deck_iter, board_to_draw) if board_to_draw else [])
+
+        hero_rank = evaluate_fn(runout, treys_hole)
+        opp_rank = evaluate_fn(runout, opp_hole)
+        if hero_rank < opp_rank:    # treys: lower = stronger
+            wins += 1
+        elif hero_rank == opp_rank:
+            ties += 1
+        else:
+            losses += 1
+
+    return _build_equity(wins, ties, losses, 2, iterations)
 
 
 def _build_equity(wins: int, ties: int, losses: int, n_players: int, iterations: int) -> Equity:

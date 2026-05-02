@@ -22,10 +22,11 @@ from typing import Iterable, Optional, TextIO
 from .cards import Card, Deck
 from .agents import Agent, BotAgent
 from .game import (
-    Action, ActionRecord, HandState, Player, PotAward,
+    Action, ActionRecord, HandState, Player, PotAward, Street,
     apply_action, award_pots, start_hand,
 )
 from .opponent_model import OpponentTable
+from .range_tracker import RangeTracker
 
 
 @dataclass
@@ -99,6 +100,8 @@ def play_one_hand(
     blinds: tuple[float, float],
     rng: random.Random,
     hand_id: int,
+    opponent_table: Optional[OpponentTable] = None,
+    range_tracker: Optional[RangeTracker] = None,
 ) -> HandResult:
     """Play exactly one hand; return a HandResult with everything observed."""
     if len(agents) != len(starting_stacks):
@@ -110,6 +113,13 @@ def play_one_hand(
     state = start_hand(players, button_index, deck, blinds)
     agent_by_id = {a.name: a for a in agents}
     starting_by_id = {a.name: s for a, s in zip(agents, starting_stacks)}
+
+    # Reset the range tracker for this hand (if provided)
+    if range_tracker is not None:
+        range_tracker.init_hand(
+            opponent_ids=[a.name for a in agents],
+            opponent_table=opponent_table,
+        )
 
     # Capture initial player snapshot
     player_snapshots = [
@@ -130,11 +140,29 @@ def play_one_hand(
         actor = state.actor()
         view = state.view_for(actor.id)
         action = agent_by_id[actor.id].decide(view)
+
+        # Snapshot context for range narrowing BEFORE applying
+        is_facing_raise = view.current_bet > blinds[1] if view.street == Street.PREFLOP else view.current_bet > 0
+        # Detect 3-bet situation: there's already been a raise (more than just BB)
+        is_threebet = view.street == Street.PREFLOP and view.current_bet > blinds[1] * 1.5
+
         # Defensive validation — if a bot returns an illegal action, fold
         try:
             apply_action(state, action)
         except ValueError:
             apply_action(state, _safe_fold())
+
+        # Narrow this opponent's range based on what they just did
+        if range_tracker is not None:
+            applied = state.actions[-1] if state.actions else None
+            if applied is not None:
+                range_tracker.narrow_for_action(
+                    opponent_id=applied.player_id,
+                    action_type=applied.action.type.value,
+                    street=applied.street.value,
+                    is_facing_raise=is_facing_raise,
+                    is_threebet_situation=is_threebet,
+                )
 
     awards = award_pots(state)
 
@@ -197,16 +225,20 @@ def run_simulation(
     # table read/write the same one, so they all see each other's stats.
     if opponent_table is None:
         opponent_table = OpponentTable()
+    # Shared range tracker — reset each hand by play_one_hand.
+    range_tracker = RangeTracker() if use_opponent_models else None
     if use_opponent_models:
         for a in agents:
             if isinstance(a, BotAgent):
                 a.opponent_table = opponent_table
+                a.range_tracker = range_tracker
     else:
         # A/B testing: disable opponent modeling on bots, but still observe
         # actions into the table for stats reporting.
         for a in agents:
             if isinstance(a, BotAgent):
                 a.opponent_table = None
+                a.range_tracker = None
 
     out_file: Optional[TextIO] = None
     if output_path is not None:
@@ -243,6 +275,7 @@ def run_simulation(
             result = play_one_hand(
                 agents=agents, starting_stacks=stacks, button_index=button_index,
                 blinds=blinds, rng=rng, hand_id=hand_id,
+                opponent_table=opponent_table, range_tracker=range_tracker,
             )
 
             # Update per-player stats from result
