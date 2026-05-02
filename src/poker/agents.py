@@ -26,6 +26,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Optional
 
+from .board_texture import analyze_texture
 from .cards import Card, Rank
 from .equity import equity_vs_random, equity_vs_range, equity_vs_ranges
 from .game import Action, ActionType, HandView, Position, Street
@@ -142,10 +143,18 @@ class BotAgent(Agent):
 
     def _decide_preflop(self, view: HandView) -> Action:
         hand = hand_class(*view.your_hole)
-        in_range = hand in self.config.preflop_range
 
-        # Already a raise in front?
-        facing_raise = view.current_bet > 1.0  # heuristic: BB = 1.0
+        # Position-aware range: UTG/MP play tighter than BTN.
+        # When facing a raise, BB and SB use the full archetype range to defend
+        # (they have to play wider to stop being exploited).
+        from .archetype_ranges import position_aware_open_set
+        pos = view.your_position.value if view.your_position else "BTN"
+        facing_raise = view.current_bet > 1.0
+        if facing_raise and pos in ("BB", "SB"):
+            applicable_range = self.config.preflop_range
+        else:
+            applicable_range = position_aware_open_set(self.config.preflop_range, pos)
+        in_range = hand in applicable_range
 
         if not in_range:
             if view.to_call == 0:
@@ -187,7 +196,7 @@ class BotAgent(Agent):
 
     def _decide_unraised(self, view: HandView, eq: float) -> Action:
         """Open or check. Uses fold equity if opponent_table available."""
-        bet_size = view.pot * self.config.cbet_pct
+        bet_size = view.pot * self._sizing_for_board(view)
 
         if self.opponent_table is None or not self.config.uses_opponent_model:
             # Legacy path: equity-only logic. Used by Maniac/Station who don't adapt.
@@ -340,6 +349,25 @@ class BotAgent(Agent):
         amount = max(target_amount, 1.0)  # at least BB
         amount = min(amount, view.your_stack)
         return Action(ActionType.BET, amount=amount)
+
+    def _sizing_for_board(self, view: HandView) -> float:
+        """Return bet size as fraction of pot, adapted to board texture.
+
+        Base = self.config.cbet_pct. Wet boards get bigger sizing (charge draws);
+        dry boards get smaller (probe + thin value). Paired boards stay near base.
+        """
+        base = self.config.cbet_pct
+        if not view.board:
+            return base
+        try:
+            tex = analyze_texture(list(view.board))
+        except ValueError:
+            return base
+        if tex.is_wet:
+            return min(base * 1.3, 1.0)   # 30% larger, capped at pot-sized
+        if tex.is_dry:
+            return max(base * 0.7, 0.33)  # 30% smaller, floored at 1/3 pot
+        return base
 
     def _raise_to(self, view: HandView, raise_to_total: float) -> Action:
         """Raise such that bet_this_round becomes raise_to_total."""

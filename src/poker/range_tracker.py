@@ -22,7 +22,8 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from .archetype_ranges import (
-    call_open_range, call_threebet_range, open_range, threebet_range,
+    call_open_range, call_threebet_range, open_range,
+    position_aware_open_range, threebet_range,
 )
 from .cards import Card
 from .opponent_model import OpponentTable, OpponentStats

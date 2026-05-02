@@ -72,6 +72,33 @@ def open_range(archetype: str) -> Range:
     }.get(archetype, TAG_OPEN)
 
 
+def position_aware_open_range(archetype: str, position_str: str) -> Range:
+    """Open range adjusted for position. UTG/MP → tighter; CO/BTN → wider.
+
+    Each position trims the archetype's full open range to a sensible subset.
+    Tightening is achieved by intersecting with a tighter base range.
+    """
+    base = open_range(archetype)
+    if position_str in ("UTG", "MP"):
+        # Tightest positions — only premium-strong subset of archetype range
+        return base.restrict_to(NIT_RANGE)
+    if position_str == "SB":
+        # Out-of-position, tightened to TAG-strength subset of archetype range
+        # (Keeps Maniac opening wide-ish; tightens Station/LAG noticeably)
+        return base.restrict_to(TAG_RANGE)
+    # CO, BTN, BB → full archetype range
+    return base
+
+
+def position_aware_open_set(archetype_range: set[str], position_str: str) -> set[str]:
+    """Same idea but operates on raw set[str] (used by BotAgent's decision logic)."""
+    if position_str in ("UTG", "MP"):
+        return archetype_range & NIT_RANGE
+    if position_str == "SB":
+        return archetype_range & TAG_RANGE
+    return archetype_range
+
+
 def call_open_range(archetype: str) -> Range:
     return {
         "Nit": NIT_CALL_OPEN, "TAG": TAG_CALL_OPEN, "LAG": LAG_CALL_OPEN,
