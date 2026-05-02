@@ -63,6 +63,8 @@ class RangeTracker:
         based on their inferred archetype (from observed stats)."""
         self.ranges.clear()
         self.archetype_by_id.clear()
+        # Reset the classification cache — new hand = new boards
+        reset_classify_cache()
         for pid in opponent_ids:
             archetype = (
                 _classify_archetype(opponent_table.get(pid))
@@ -137,18 +139,16 @@ def _narrow_postflop(
 ) -> Range:
     """Compute a new range after observing a postflop action.
 
-    Per-class weighting strategy: for each hand class in the range, compute
-    the average "stay weight" across all its combos (after excluding board
-    cards) based on their strength on this board.
+    PER-COMBO weighting: each specific combo is classified on the board and
+    weighted independently. This matters on flush-heavy / paired boards where
+    different combos of the same class (e.g. AKo) have very different strength.
 
-    - 'call' or 'bet': made hands (pair+) stay at full weight; strong draws
-      stay at full weight; weak draws stay at partial weight; air drops out.
-    - 'raise': only strong made hands (two pair+) stay at full weight;
-      pair stays at partial weight; strong draws stay at partial weight
-      (semi-bluffs); air gets a small "bluff" weight.
-
-    Different archetypes have different bluff frequencies, but for v1 we
-    use a single rule with mild archetype variation.
+    Weight maps:
+    - 'call' or 'bet': made hands (pair+) and strong draws stay at full weight;
+      weak draws stay at partial weight; air drops out.
+    - 'raise': strong made hands (two pair+ and overpairs) stay at full weight;
+      pair gets demoted; strong draws stay at partial weight (semi-bluffs);
+      air gets a small per-archetype bluff weight.
     """
     bluff_weight_by_archetype = {
         "Nit": 0.0, "TAG": 0.10, "LAG": 0.20, "Maniac": 0.40, "Station": 0.0,
@@ -167,31 +167,45 @@ def _narrow_postflop(
         weight_map = {
             "made_strong": 1.0,
             "made_pair": 0.4,
-            "strong_draw": 0.5,    # semi-bluffs
+            "strong_draw": 0.5,
             "weak_draw": 0.1,
-            "air": bluff_w,        # pure bluffs (varies by archetype)
+            "air": bluff_w,
         }
     else:
-        # Includes 'check' — don't narrow on checks (too noisy at this fidelity)
         return rng_range
 
     board_set = set(board)
-    new_weights: dict[str, float] = {}
-    for hand_class, base_w in rng_range.weights.items():
+    # Cache: (combo_key, board_tuple) → classification. Multiple opponents on
+    # the same street share the same board — this turns N narrowings × 1326
+    # classifications into max ~1326 unique evaluations per street.
+    cache_key_prefix = tuple(board)
+    new_weights: dict = {}
+    classify_cache = _classify_cache.setdefault(cache_key_prefix, {})
+
+    for combo_key, base_w in rng_range.weights.items():
         if base_w <= 0:
             continue
-        # Average across non-blocked combos for this class
-        combos = expand_combos(hand_class)
-        usable = [combo for combo in combos if not any(c in board_set for c in combo)]
-        if not usable:
-            continue
-        total_keep = 0.0
-        for combo in usable:
-            cls = classify_combo_on_board(combo, board)
-            total_keep += weight_map.get(cls, 0.0)
-        avg_keep = total_keep / len(usable)
-        new_w = base_w * avg_keep
-        if new_w > 0.01:    # drop hands with negligible weight
-            new_weights[hand_class] = new_w
+        c1, c2 = tuple(combo_key)
+        if c1 in board_set or c2 in board_set:
+            continue   # blocked
+        # Cached per-combo classification on this specific board
+        cls = classify_cache.get(combo_key)
+        if cls is None:
+            cls = classify_combo_on_board((c1, c2), board)
+            classify_cache[combo_key] = cls
+        keep = weight_map.get(cls, 0.0)
+        new_w = base_w * keep
+        if new_w > 0.01:
+            new_weights[combo_key] = new_w
 
     return Range(new_weights)
+
+
+# Module-level classification cache. Keyed by board tuple → {combo_key: class_str}.
+# Cleared between hands by reset_classify_cache().
+_classify_cache: dict = {}
+
+
+def reset_classify_cache() -> None:
+    """Clear the classification cache (call between hands)."""
+    _classify_cache.clear()

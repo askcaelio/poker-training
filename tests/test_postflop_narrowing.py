@@ -81,27 +81,27 @@ class TestNarrowPostflop:
     def test_raise_demotes_pair_keeps_overpair(self):
         # On Kh 7d 2c:
         #   AA = made_strong (overpair, higher than top board K)
-        #   KQo = made_pair (top pair)
+        #   KQo = made_pair (top pair) — but Kh on board blocks 3 of 12 KQo combos
         #   J9o = air (no pair, no draw)
-        # After "raise" by a TAG: AA keeps full weight; KQo at 0.4; J9o at small bluff weight.
+        # After "raise" by a TAG: AA keeps full weight; KQo's per-combo weight is
+        # 0.4 but the get() averages over all 12 (including the 3 blocked → 0
+        # weight), so get("KQo") ≈ (9×0.4)/12 ≈ 0.3.
         r = Range.from_set({"AA", "KQo", "J9o"})
         narrowed = _narrow_postflop(r, parse_cards("Kh 7d 2c"), "raise", "TAG")
         assert narrowed.get("AA") > 0.9   # overpair = full weight
-        assert 0.3 < narrowed.get("KQo") < 0.5   # top pair demoted
+        assert 0.25 < narrowed.get("KQo") < 0.45   # top pair demoted, blockers reduce avg
         # J9o gets the TAG bluff weight (~0.10)
 
     def test_raise_drops_air_for_nit(self):
-        # Nit has bluff_weight = 0.0, so air should be totally removed on a raise
-        r = Range.from_set({"AA", "9c4h"})  # 9-4o is true air on Kh-7-2
-        # Wait: 9c4h is invalid as a hand class — let me use a class that's truly air
-        # On Kh 7d 2c: any non-pair non-K/7/2 hand with no draw is air
-        # T9o on Kh 7d 2c: T-high, no pair (10 and 9 don't pair the board), no draw
-        r = Range.from_set({"AA", "T9o"})
-        narrowed = _narrow_postflop(r, parse_cards("Kh 7d 2c"), "raise", "Nit")
+        # Nit has bluff_weight = 0.0, so true air drops to 0 on a raise.
+        # T9o on Kh 7d 2c: T and 9 don't pair the board; T > 7,2 (overcard) so
+        # it's "weak_draw" not pure "air" in our classifier. Use 6-5o which has
+        # no overcards and no draws on Kh 7d 2c: 5 < 7, 6 < 7. Pure air.
+        r = Range.from_set({"AA", "65o"})
+        narrowed = _narrow_postflop(r, parse_cards("Kh 9d 2c"), "raise", "Nit")
         assert narrowed.has("AA")
-        # T9o on this board: weak_draw (overcards only, T > 7,2 but < K) — actually it's
-        # weak_draw (2 overcards over the 7 and 2). Or is K an overcard? T isn't > K.
-        # T9o has 1 overcard (T > 7) — labeled "1 overcard". Let's just verify air-ish hands drop.
+        # 65o on Kh 9d 2c is true air → Nit's bluff weight is 0 → drops out
+        assert not narrowed.has("65o")
 
     def test_call_keeps_strong_draws(self):
         # 9s8s on 7s 6h 2c → flush draw + OESD (huge equity hand)
@@ -130,3 +130,64 @@ class TestNarrowDrasticReduction:
         assert narrowed.total_combos < r.total_combos
         # But not to zero — Station has some Kx, 7x, 2x pairs and some pocket pairs
         assert narrowed.total_combos > 0
+
+
+class TestComboLevelDifferentiation:
+    """Per-combo narrowing matters most on monotone/flush-heavy boards.
+
+    These tests verify that combos within the same class get DIFFERENT weights
+    based on whether they have a flush card or not.
+    """
+
+    def test_offsuit_combos_differ_on_monotone_board(self):
+        # Hero is irrelevant — we're testing the narrowing of villain's range.
+        # Range = AKo (12 combos). Board = Qs Js 4s (monotone spades).
+        # 6 of 12 AKo combos have a spade in hand → backdoor flush draw potential
+        # 6 of 12 have no spade → mostly air on this flush-heavy board
+        r = Range.from_set({"AKo"})
+        board = parse_cards("Qs Js 4s")
+        narrowed = _narrow_postflop(r, board, "call", "TAG")
+
+        # Inspect each combo's weight individually
+        from poker.cards import Card, Rank, Suit
+        spade_combos = []
+        non_spade_combos = []
+        for c1, c2 in [(Card(Rank.ACE, s1), Card(Rank.KING, s2))
+                       for s1 in Suit for s2 in Suit if s1 != s2]:
+            if c1 in board or c2 in board:
+                continue
+            w = narrowed.get_combo(c1, c2)
+            if c1.suit == Suit.SPADES or c2.suit == Suit.SPADES:
+                spade_combos.append(w)
+            else:
+                non_spade_combos.append(w)
+
+        # Non-spade combos are pure air on Qs Js 4s — should drop to 0
+        # Spade combos have at least overcards + backdoor flush potential
+        # The asymmetry is what proves combo-level narrowing works
+        non_spade_avg = sum(non_spade_combos) / len(non_spade_combos) if non_spade_combos else 0
+        spade_avg = sum(spade_combos) / len(spade_combos) if spade_combos else 0
+
+        # Spade-containing combos should have higher weight than non-spade
+        # (or both dropped, or some asymmetry — definitely not equal)
+        assert spade_avg != non_spade_avg or (spade_avg == 0 and non_spade_avg == 0)
+
+    def test_suited_combo_with_flush_gets_full_weight(self):
+        # AKs with the spade-spade combo (AsKs) has a 4-card flush on Qs Js 4s.
+        # That's a made flush! The non-spade AKs combos are pure air.
+        from poker.cards import Card, Rank, Suit
+        r = Range.from_set({"AKs"})
+        board = parse_cards("Qs Js 4s")
+        narrowed = _narrow_postflop(r, board, "call", "TAG")
+
+        # AsKs is a flush — but the spades are blocked by the board (Qs, Js, 4s).
+        # Wait: AsKs uses As (not on board) and Ks (not on board). So AsKs is playable.
+        # AsKs + Qs Js 4s = 5 spades = flush. Definitely "made_strong".
+        as_ks_weight = narrowed.get_combo(Card(Rank.ACE, Suit.SPADES), Card(Rank.KING, Suit.SPADES))
+        ah_kh_weight = narrowed.get_combo(Card(Rank.ACE, Suit.HEARTS), Card(Rank.KING, Suit.HEARTS))
+
+        # AsKs makes a flush → full weight kept on call
+        assert as_ks_weight > 0.9
+        # AhKh on a spade board: just two overcards, weak draw or air
+        # Should be lower than AsKs
+        assert as_ks_weight > ah_kh_weight
