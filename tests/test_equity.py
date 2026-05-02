@@ -155,3 +155,22 @@ class TestDeterminism:
         eq = equity_vs_random(parse_cards("As Ah"), iterations=5000, rng=rng())
         total = eq.win_pct + eq.tie_pct + eq.lose_pct
         assert abs(total - 100.0) < 0.001
+
+
+class TestPreflopLUT:
+    def test_aa_vs_one_random_about_85(self):
+        from poker.equity import preflop_equity_class
+        eq = preflop_equity_class("AA", num_opponents=1)
+        assert 83 < eq < 88
+
+    def test_72o_vs_one_random_about_35(self):
+        from poker.equity import preflop_equity_class
+        eq = preflop_equity_class("72o", num_opponents=1)
+        assert 30 < eq < 40
+
+    def test_cache_returns_same_value(self):
+        from poker.equity import preflop_equity_class
+        first = preflop_equity_class("KK", num_opponents=1)
+        second = preflop_equity_class("KK", num_opponents=1)
+        # Should be identical (cached)
+        assert first == second

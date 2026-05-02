@@ -140,3 +140,55 @@ class TestPolarizedRiver:
         action = bot._decide_river(view, eq=0.10)
         # Without opponent_table set, bot can't compute fold equity; checks.
         assert action.type == ActionType.CHECK
+
+
+class TestReverseImpliedOdds:
+    def test_one_pair_wet_board_penalty(self):
+        # Hero has top pair (KQ on K-9-8 with two spades and connected) — vulnerable
+        view = make_view("Ks Kd", "Qs Js Tc", pot=100, to_call=40,
+                         your_stack=200, opp_stack=200, street=Street.FLOP)
+        bot = make_tag(rng=random.Random(0))
+        # Reverse implied: required_eq goes UP for vulnerable made hand on wet board
+        # Note: KsKd on QsJsTc is actually overpair... let me reconsider
+        # With KK on QJT, hero has overpair which classifies as made_strong
+        # Use a true one-pair scenario: KQ on KQT? wait that's two-pair.
+        # Just use AK on K-board with wet texture: A♠K♣ on K♠Q♠J♥ (top pair)
+        view2 = make_view("Ac Kc", "Ks Qs Jh", pot=100, to_call=40,
+                          your_stack=200, opp_stack=200, street=Street.FLOP)
+        adjusted = bot._apply_implied_odds(view2, required_eq=0.30, eq=0.65)
+        # Top pair on wet (two spades + straight texture) board → penalty applied
+        assert adjusted > 0.30
+
+    def test_strong_hand_no_penalty(self):
+        # Set on a wet board — no penalty (strong made hand, not vulnerable)
+        view = make_view("Ks Kd", "Kh Qs Js", pot=100, to_call=40,
+                         your_stack=200, opp_stack=200, street=Street.FLOP)
+        bot = make_tag(rng=random.Random(0))
+        # Trips (set of K's) is made_strong, not made_pair → no penalty
+        adjusted = bot._apply_implied_odds(view, required_eq=0.30, eq=0.85)
+        assert adjusted == 0.30
+
+
+class TestBlockerBluffs:
+    def test_nut_flush_blocker_helps_river_bluff(self):
+        # Hero has A♠ on a 4-spade board (would-be flush board for villain).
+        # Even with low equity, the blocker makes a bluff more credible.
+        from poker.cards import Card, Rank, Suit
+        view = make_view("As 7d", "Ks 8s 4s 2s 9c", pot=50, to_call=0,
+                         your_stack=200, opp_stack=200, street=Street.RIVER)
+        bot = make_tag(rng=random.Random(0))
+        assert bot._has_blocker_to_villain_value(view) is True
+
+    def test_no_blocker_when_no_flush_card(self):
+        # Hero has no spade on a 3-spade board
+        view = make_view("Ah 7d", "Ks 8s 4s 2c 9c", pot=50, to_call=0,
+                         your_stack=200, opp_stack=200, street=Street.RIVER)
+        bot = make_tag(rng=random.Random(0))
+        assert bot._has_blocker_to_villain_value(view) is False
+
+    def test_no_blocker_on_dry_board(self):
+        # Rainbow board, no flush threat
+        view = make_view("As 7d", "Kh 8d 4c", pot=50, to_call=0,
+                         your_stack=200, opp_stack=200, street=Street.FLOP)
+        bot = make_tag(rng=random.Random(0))
+        assert bot._has_blocker_to_villain_value(view) is False

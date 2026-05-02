@@ -377,6 +377,43 @@ def equity_vs_ranges(
     return _build_equity(wins, ties, losses, len(opponent_ranges) + 1, total)
 
 
+# ─── Preflop equity LUT ──────────────────────────────────────────────────────
+
+# Computed lazily on first access. Keyed by (hand_class, num_opponents).
+# Values: equity_pct (0-100) at 30k iterations.
+_PREFLOP_EQUITY_CACHE: dict[tuple[str, int], float] = {}
+
+
+def preflop_equity_class(
+    hand_class: str,
+    num_opponents: int = 1,
+    iterations: int = 30_000,
+) -> float:
+    """Cached equity for a 169-class hand vs N random opponents (preflop).
+
+    Uses 30k iterations on first compute; subsequent calls hit the cache.
+    Useful for dashboards, demos, and bot preflop intuition without paying
+    the MC cost repeatedly.
+    """
+    key = (hand_class, num_opponents)
+    if key in _PREFLOP_EQUITY_CACHE:
+        return _PREFLOP_EQUITY_CACHE[key]
+
+    # Pick an arbitrary canonical combo for this class (e.g., As/Ks for AKs).
+    from .range_model import expand_combos
+    combos = expand_combos(hand_class)
+    if not combos:
+        _PREFLOP_EQUITY_CACHE[key] = 0.0
+        return 0.0
+    canonical_combo = combos[0]
+    eq = equity_vs_random(
+        list(canonical_combo), num_opponents=num_opponents,
+        iterations=iterations, rng=random.Random(42),
+    ).equity_pct
+    _PREFLOP_EQUITY_CACHE[key] = eq
+    return eq
+
+
 def _build_equity(wins: int, ties: int, losses: int, n_players: int, iterations: int) -> Equity:
     win_pct = 100.0 * wins / iterations
     tie_pct = 100.0 * ties / iterations

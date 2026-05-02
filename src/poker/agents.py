@@ -186,9 +186,22 @@ class BotAgent(Agent):
 
     def _decide_postflop(self, view: HandView) -> Action:
         n_opps = max(1, view.num_active_opponents)
-        # Prefer equity vs the most-aggressive active opponent's INFERRED range.
-        # Falls back to vs-random when no range tracker / no live opponent.
-        eq = self._compute_postflop_equity(view, n_opps)
+
+        # Speed shortcut: if hero has a monster (set or better), no need to
+        # compute equity — just play it for value. Saves the MC entirely on
+        # the strongest hands.
+        from .evaluator import evaluate as _eval
+        try:
+            hand_strength = _eval(list(view.your_hole), list(view.board))
+            # category_index <= 6 means Three of a Kind or stronger (treys convention)
+            is_monster = hand_strength.category_index <= 6
+        except ValueError:
+            is_monster = False
+
+        if is_monster:
+            eq = 0.95   # don't bother with MC — it's a value bet either way
+        else:
+            eq = self._compute_postflop_equity(view, n_opps)
 
         # River gets specialized polarized betting logic — value/bluff/check
         # rather than a single equity threshold.
@@ -283,28 +296,55 @@ class BotAgent(Agent):
 
     def _decide_river(self, view: HandView, eq: float) -> Action:
         """River-specific polarized logic: value bet very strong, bluff very
-        weak (with fold equity), check the middle (showdown value)."""
+        weak (with fold equity, preferring blocker hands), check the middle.
+        """
         if view.to_call > 0:
-            # Facing a bet on the river — call only with bluff catchers or better
             return self._decide_facing_bet(view, eq)
 
-        # No bet to face — either bet (value or bluff) or check
-        bet_size = view.pot * self._sizing_for_board(view) * 1.1  # river often larger
+        bet_size = view.pot * self._sizing_for_board(view) * 1.1
 
         # Value zone: very strong hands → bet for value
         if eq >= 0.75:
             return self._bet(view, bet_size)
 
         # Bluff zone: very weak hands with fold equity → bluff
+        # Prefer hands that BLOCK villain's value range (e.g., nut flush blocker
+        # on a flush board makes the bluff much more credible because villain
+        # can't have the nuts as often).
         if eq < 0.20 and self.opponent_table is not None and self.config.uses_opponent_model:
             fold_eq = self._avg_fold_equity(view, context="barrel")
-            # Bluff breakeven: fold_eq > bet / (bet + pot)
             required_fold_eq = bet_size / (bet_size + view.pot)
-            if fold_eq > required_fold_eq + 0.05:
+            has_blocker = self._has_blocker_to_villain_value(view)
+            # Blocker hands need less fold equity buffer; non-blockers need more
+            buffer = 0.0 if has_blocker else 0.10
+            if fold_eq > required_fold_eq + buffer:
                 return self._bet(view, bet_size)
 
         # Middle: showdown value — check it down
         return Action(ActionType.CHECK)
+
+    def _has_blocker_to_villain_value(self, view: HandView) -> bool:
+        """True if hero holds a card that blocks villain's nut value hand.
+
+        Currently detects: on a 3+ flush-suit board, hero holds the A of
+        that suit → villain can't have the nut flush. Strongest blocker effect.
+        """
+        if not view.board:
+            return False
+        # Find dominant suit if board is 3+ flush
+        suit_counts: dict = {}
+        for c in view.board:
+            suit_counts[c.suit] = suit_counts.get(c.suit, 0) + 1
+        if not suit_counts:
+            return False
+        dominant_suit = max(suit_counts.keys(), key=lambda s: suit_counts[s])
+        if suit_counts[dominant_suit] < 3:
+            return False
+        # Hero blocks if they hold the Ace of that suit (or a high card)
+        for c in view.your_hole:
+            if c.suit == dominant_suit and c.rank == Rank.ACE:
+                return True
+        return False
 
     # ─── SPR + implied odds ─────────────────────────────────────────────────
 
@@ -325,24 +365,44 @@ class BotAgent(Agent):
     def _apply_implied_odds(
         self, view: HandView, required_eq: float, eq: float,
     ) -> float:
-        """Adjust the required equity downward when we have a clear draw and
-        deep stacks behind. Implied odds = "we'll win more on later streets."
+        """Adjust required equity for both implied odds (draws in deep games
+        get a discount) and reverse implied odds (vulnerable made hands on
+        wet boards face a penalty).
         """
-        # Only adjusts on flop/turn (river has no implied odds)
         if view.street == Street.RIVER or not view.board:
             return required_eq
         spr = self._spr(view)
         if spr < 2.0:
-            return required_eq   # no implied — already committed
-        # Detect "drawing" hand: low equity but with enough to be a real draw
-        # Threshold heuristic: 25-45% equity = likely a draw, not a made hand
-        is_drawing = 0.25 <= eq <= 0.45
-        if not is_drawing:
             return required_eq
-        # Implied factor: deeper stacks = bigger discount, capped
-        implied_factor = min(spr * 0.05, 0.15)   # at SPR=10: 0.05*10=0.5, capped to 0.15
-        # Discount required equity by the implied factor
-        return required_eq * (1 - implied_factor)
+
+        # Forward implied: drawing hands get a discount
+        is_drawing = 0.25 <= eq <= 0.45
+        if is_drawing:
+            implied_factor = min(spr * 0.05, 0.15)
+            return required_eq * (1 - implied_factor)
+
+        # Reverse implied: vulnerable made hands (one pair) on wet boards
+        # face a penalty — even when ahead now, future bets cost us more
+        # than they gain when we get there safely.
+        if eq > 0.55 and self._is_one_pair_on_wet_board(view):
+            penalty_factor = min(spr * 0.04, 0.12)
+            return required_eq * (1 + penalty_factor)
+
+        return required_eq
+
+    def _is_one_pair_on_wet_board(self, view: HandView) -> bool:
+        """True if hero has exactly one pair on a wet board — vulnerable spot."""
+        if not view.board:
+            return False
+        from .evaluator import evaluate as _eval
+        from .board_texture import analyze_texture
+        try:
+            hs = _eval(list(view.your_hole), list(view.board))
+            tex = analyze_texture(list(view.board))
+        except ValueError:
+            return False
+        # Pair-only AND wet board (lots of draws to outdraw us)
+        return hs.category_index == 8 and tex.is_wet
 
     def _compute_postflop_equity(self, view: HandView, n_opps: int) -> float:
         """Pick the best equity calc for the situation.
