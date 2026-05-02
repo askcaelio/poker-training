@@ -29,6 +29,7 @@ from typing import Optional
 from .cards import Card, Rank
 from .equity import equity_vs_random
 from .game import Action, ActionType, HandView, Position, Street
+from .opponent_model import OpponentTable, estimate_fold_equity
 
 
 # ─── Hand class strings ───────────────────────────────────────────────────────
@@ -140,6 +141,7 @@ class BotConfig:
     equity_iters: int = 800         # MC iterations per decision (lower = faster, ~3% precision)
     aggression: float = 0.5         # P(raise vs call) when both look fine
     prefer_limp: bool = False       # if True, opens with call rather than raise (Station-style)
+    uses_opponent_model: bool = True   # smart archetypes adapt to villain stats; Maniac/Station ignore
 
     def __post_init__(self):
         if self.preflop_range is None:
@@ -149,10 +151,19 @@ class BotConfig:
 class BotAgent(Agent):
     """Generic bot driven by a BotConfig. Use the archetype constructors below."""
 
-    def __init__(self, name: str, config: BotConfig, rng: Optional[random.Random] = None):
+    def __init__(
+        self,
+        name: str,
+        config: BotConfig,
+        rng: Optional[random.Random] = None,
+        opponent_table: Optional[OpponentTable] = None,
+    ):
         self.name = name
         self.config = config
         self.rng = rng if rng is not None else random.Random()
+        # Opponent stats for fold-equity-aware decisions. Optional — when None,
+        # bot falls back to the simpler bluff_freq / value_threshold logic.
+        self.opponent_table = opponent_table
 
     def decide(self, view: HandView) -> Action:
         if view.street == Street.PREFLOP:
@@ -210,33 +221,100 @@ class BotAgent(Agent):
         except ValueError:
             eq = 0.0
 
-        # Pot odds (only meaningful if facing a bet)
-        if view.to_call > 0:
-            required_eq = view.to_call / (view.pot + view.to_call)
-        else:
-            required_eq = 0.0
-
         if view.to_call == 0:
-            # Open or check
+            return self._decide_unraised(view, eq)
+        return self._decide_facing_bet(view, eq)
+
+    def _decide_unraised(self, view: HandView, eq: float) -> Action:
+        """Open or check. Uses fold equity if opponent_table available."""
+        bet_size = view.pot * self.config.cbet_pct
+
+        if self.opponent_table is None or not self.config.uses_opponent_model:
+            # Legacy path: equity-only logic. Used by Maniac/Station who don't adapt.
             if eq >= self.config.value_threshold:
-                return self._bet(view, view.pot * self.config.cbet_pct)
+                return self._bet(view, bet_size)
             if self.rng.random() < self.config.bluff_freq:
-                return self._bet(view, view.pot * self.config.cbet_pct)
+                return self._bet(view, bet_size)
             return Action(ActionType.CHECK)
 
-        # Facing a bet
+        # Strong hands always value-bet — the equity-vs-random underestimates
+        # equity vs villain's calling range, so the EV math undersells value bets.
+        # Fold-equity logic only applies to marginal/bluff decisions.
+        if eq >= self.config.value_threshold:
+            return self._bet(view, bet_size)
+
+        # Marginal/weak hand: use fold-equity math to decide bluff vs check.
+        fold_eq = self._avg_fold_equity(view, context="cbet")
+
+        # EV(check) ≈ eq * pot   (rough: assume showdown, no further betting)
+        ev_check = eq * view.pot
+        # EV(bet) = fold_eq * pot + (1 - fold_eq) * (eq * (pot + 2*bet) - bet)
+        ev_bet = (
+            fold_eq * view.pot
+            + (1 - fold_eq) * (eq * (view.pot + 2 * bet_size) - bet_size)
+        )
+
+        if ev_bet > ev_check + 0.5:  # small bias toward checking on ties
+            return self._bet(view, bet_size)
+        return Action(ActionType.CHECK)
+
+    def _decide_facing_bet(self, view: HandView, eq: float) -> Action:
+        """Fold, call, or raise. Uses fold equity for raise-as-bluff decisions."""
+        required_eq = view.to_call / (view.pot + view.to_call)
         equity_edge = eq - required_eq
+        raise_total = view.current_bet + view.pot * 1.0
+
+        # Strong hand → raise for value (with fold-eq blending the EV when available)
         if equity_edge > 0.15 and self.rng.random() < self.config.aggression:
-            # Comfortable raise
-            target_total = view.current_bet + view.pot * 1.0
-            return self._raise_to(view, target_total)
+            return self._raise_to(view, raise_total)
+
+        # Marginal but priced-in → call
         if equity_edge > self.config.fold_threshold_buffer:
             return self._call_or_check(view)
-        # Below threshold: fold, or bluff-raise
+
+        # Weak hand below pot odds → fold or bluff-raise.
+        # Bluff-raise EV requires significant fold equity vs the bettor.
+        if self.opponent_table is not None and self.config.uses_opponent_model:
+            # Find the bettor — heuristic: the most recent aggressor in this round
+            bettor_id = self._last_aggressor_id(view)
+            if bettor_id is not None:
+                fold_eq = estimate_fold_equity(
+                    bettor_id, self.opponent_table, context="barrel",
+                )
+                # Bluff-raise EV: roughly fold_eq * (pot + their_bet) - bet_cost
+                # Required fold_eq for breakeven: bet_cost / (bet_cost + pot)
+                bet_cost = raise_total - view.your_bet_this_round
+                required_fold_eq = bet_cost / (bet_cost + view.pot + view.to_call)
+                if fold_eq > required_fold_eq + 0.05:
+                    return self._raise_to(view, raise_total)
+            return Action(ActionType.FOLD)
+
+        # No opponent model — fall back to random bluff frequency
         if self.rng.random() < self.config.bluff_freq:
-            target_total = view.current_bet + view.pot * 1.0
-            return self._raise_to(view, target_total)
+            return self._raise_to(view, raise_total)
         return Action(ActionType.FOLD)
+
+    def _avg_fold_equity(self, view: HandView, context: str) -> float:
+        """Average fold-equity across active opponents (those still in the hand)."""
+        if self.opponent_table is None:
+            return 0.4
+        active = [o for o in view.others if not o.folded]
+        if not active:
+            return 0.0
+        fold_eqs = [
+            estimate_fold_equity(o.id, self.opponent_table, context)
+            for o in active
+        ]
+        # Use the *minimum* fold-eq, not average — only takes one stubborn caller
+        # to make a bluff fail. This is closer to multiway reality than averaging.
+        return min(fold_eqs)
+
+    def _last_aggressor_id(self, view: HandView) -> Optional[str]:
+        """Identify the player who made the most recent bet/raise this street."""
+        for rec in reversed(view.action_history):
+            if rec.street == view.street and rec.action.type in (ActionType.BET, ActionType.RAISE):
+                return rec.player_id
+        return None
 
     # ─── Helpers ───────────────────────────────────────────────────────────
 
@@ -287,19 +365,23 @@ def make_lag(name: str = "LAG", rng: Optional[random.Random] = None) -> BotAgent
 
 
 def make_maniac(name: str = "Maniac", rng: Optional[random.Random] = None) -> BotAgent:
+    # Maniacs DON'T adapt — they bet wildly regardless of opponent. That's the trait.
     return BotAgent(name, BotConfig(
         name="Maniac", preflop_range=MANIAC_RANGE, open_size_bb=4.0,
         cbet_pct=1.0, value_threshold=0.45, bluff_freq=0.55,
         fold_threshold_buffer=-0.10, aggression=0.90,
+        uses_opponent_model=False,
     ), rng=rng)
 
 
 def make_station(name: str = "Station", rng: Optional[random.Random] = None) -> BotAgent:
+    # Stations DON'T adapt — they call regardless of opponent profile. That's the trait.
     return BotAgent(name, BotConfig(
         name="Station", preflop_range=STATION_RANGE, open_size_bb=2.5,
         cbet_pct=0.5, value_threshold=0.65, bluff_freq=0.02,
         fold_threshold_buffer=-0.20,  # calls way below pot odds
         aggression=0.10, prefer_limp=True,
+        uses_opponent_model=False,
     ), rng=rng)
 
 

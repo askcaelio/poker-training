@@ -20,11 +20,12 @@ from pathlib import Path
 from typing import Iterable, Optional, TextIO
 
 from .cards import Card, Deck
-from .agents import Agent
+from .agents import Agent, BotAgent
 from .game import (
     Action, ActionRecord, HandState, Player, PotAward,
     apply_action, award_pots, start_hand,
 )
+from .opponent_model import OpponentTable
 
 
 @dataclass
@@ -45,16 +46,27 @@ class SimStats:
     """Aggregate stats across many hands."""
     total_hands: int = 0
     per_player: dict[str, dict] = field(default_factory=dict)
+    opponent_table: Optional["OpponentTable"] = None
 
     def __str__(self) -> str:
         lines = [f"Sim: {self.total_hands:,} hands\n"]
-        header = f"  {'player':<14} {'hands':>6} {'VPIP':>6} {'PFR':>6} {'won/hand':>10} {'BB/100':>8}"
+        header = f"  {'player':<14} {'hands':>6} {'VPIP':>6} {'PFR':>6} {'FvCB':>6} {'AF':>5} {'won/hand':>10} {'BB/100':>8}"
         lines.append(header)
         lines.append("  " + "─" * (len(header) - 2))
         for pid, s in sorted(self.per_player.items()):
+            # Pull observed-by-others FvCB/AF from the shared opponent table if we have it
+            fvcb_str = "  -- "
+            af_str = "  --"
+            if self.opponent_table is not None:
+                stats = self.opponent_table.get(pid)
+                if stats.cbets_faced > 0:
+                    fvcb_str = f"{stats.fold_to_cbet * 100:>4.0f}%"
+                if stats.postflop_calls + stats.postflop_bets_or_raises > 0:
+                    af_str = f"{stats.aggression_factor:>4.1f}"
             lines.append(
                 f"  {pid:<14} {s['hands']:>6d} "
                 f"{s['vpip_pct']:>5.1f}% {s['pfr_pct']:>5.1f}% "
+                f"{fvcb_str:>6} {af_str:>5} "
                 f"{s['avg_won']:>9.2f}  {s['bb_per_100']:>+7.1f}"
             )
         return "\n".join(lines)
@@ -157,6 +169,8 @@ def run_simulation(
     output_path: Optional[Path] = None,
     seed: Optional[int] = None,
     progress_every: int = 0,
+    opponent_table: Optional[OpponentTable] = None,
+    use_opponent_models: bool = True,
 ) -> SimStats:
     """Play `num_hands` hands at a table of agents.
 
@@ -178,6 +192,21 @@ def run_simulation(
     if num_hands <= 0:
         raise ValueError("num_hands must be > 0")
     rng = random.Random(seed) if seed is not None else random.Random()
+
+    # Shared opponent table — created if not passed in. All BotAgents at the
+    # table read/write the same one, so they all see each other's stats.
+    if opponent_table is None:
+        opponent_table = OpponentTable()
+    if use_opponent_models:
+        for a in agents:
+            if isinstance(a, BotAgent):
+                a.opponent_table = opponent_table
+    else:
+        # A/B testing: disable opponent modeling on bots, but still observe
+        # actions into the table for stats reporting.
+        for a in agents:
+            if isinstance(a, BotAgent):
+                a.opponent_table = None
 
     out_file: Optional[TextIO] = None
     if output_path is not None:
@@ -238,6 +267,13 @@ def run_simulation(
             for pid in pfr_this_hand:
                 per_player[pid]["pfr_hands"] += 1
 
+            # Feed the hand into the shared opponent table — bots will see
+            # updated stats on the very next hand.
+            opponent_table.observe_hand({
+                "players": result.players,
+                "actions": result.actions,
+            })
+
             if persistent_stacks:
                 stacks = [snap["ending_stack"] for snap in result.players]
 
@@ -262,7 +298,7 @@ def run_simulation(
             out_file.close()
 
     # Build aggregate stats
-    stats = SimStats(total_hands=num_hands)
+    stats = SimStats(total_hands=num_hands, opponent_table=opponent_table)
     for pid, s in per_player.items():
         h = max(1, s["hands"])
         vpip_pct = 100.0 * s["vpip_hands"] / h

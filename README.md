@@ -4,7 +4,8 @@ A Texas Hold'em training tool focused on building **probability intuition** —
 and a self-contained simulation engine that runs autonomously for analysis or
 ML training data.
 
-> **Status:** Phase 1 (math engine) ✅ + Phase 2 (game flow + bots) ✅
+> **Status:** Phase 1 (math engine) ✅ + Phase 2 (game flow + bots) ✅ +
+> Phase 2.5 (opponent modeling + fold equity) ✅
 > Range modeling and a GUI are next on the roadmap.
 
 ## What it does
@@ -31,6 +32,10 @@ ML training data.
   (+EV / -EV / Break-even) and the dollar EV of the call
 - **Bot reading** — opponents have explicit personalities you can study:
   Nit (~7% VPIP), TAG (~20%), LAG (~30%), Maniac (~50%), Station (~85%)
+- **Adaptive bots** — TAG/LAG/Nit track per-opponent stats (VPIP, fold-to-cbet,
+  aggression factor) and use *fold equity* in their decisions. They stop
+  bluffing stations after ~20 hands of evidence. Maniac/Station deliberately
+  do NOT adapt — that's their archetype.
 
 ## Sample dashboard
 
@@ -86,13 +91,16 @@ src/poker/
   dashboard.py   # assembles the heads-up display
   game.py        # game state machine: Player, Action, Pot, HandState, side pots
   agents.py      # Agent abstraction + 5 bot archetypes (Nit/TAG/LAG/Maniac/Station)
+  opponent_model.py  # per-opponent stats + fold-equity estimation
   simulator.py   # multi-hand runner, JSONL dump, aggregate stats
 scripts/
   demo_diamonds.py   # the classic flush-draw probability question
   walkthrough.py     # full hand street-by-street with the dashboard each street
   play.py            # interactive: you vs 5 bots, dashboard each decision
   simulate.py        # autonomous: N hands of bot vs bot, JSONL dump + stats
-tests/             # 172 tests, validates against textbook matchups
+  narrate.py         # one hand from a chosen POV with full annotations
+  compare_models.py  # A/B test: with vs without opponent modeling
+tests/             # 184 tests, validates against textbook matchups
 ```
 
 ## Setup
@@ -111,12 +119,14 @@ uv run python scripts/simulate.py 1000     # 1000-hand bot-vs-bot sim → JSONL
 
 - **Phase 1 — math engine** ✅
 - **Phase 2 — game flow + bots + simulator** ✅
+- **Phase 2.5 — opponent modeling + fold equity** ✅
+  - Bots track per-opponent VPIP/PFR/fold-to-cbet/aggression
+  - Postflop decisions use fold-equity-aware EV math
+  - Smart archetypes (TAG/LAG/Nit) adapt; Maniac/Station deliberately don't
 - **Phase 3 — ranges** — 13×13 hand-grid model, range narrowing as villains
-  act, equity vs ranges (not just random). Closes the realistic-equity gap
-  between random opponents and ones who are actually betting.
+  act, equity vs ranges (not just random). Closes the realistic-equity gap.
 - **Phase 4 — speed pass** — switch to a faster evaluator (phevaluator), or
-  vectorize the Monte Carlo loop with numpy. Currently ~65ms/hand — fine for
-  thousands of hands, slow for hundreds of thousands.
+  vectorize the Monte Carlo loop with numpy.
 - **Phase 5 — GUI** — likely SwiftUI for the iOS path.
 
 ## Design notes
